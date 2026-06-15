@@ -1,0 +1,15 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Secrets & local config (OpenRouter key lives here — never commit)
+.env
+.env.*
+
+# Local Vault — contains plaintext PII originals. NEVER commit.
+*.db
+*.sqlite
+*.sqlite3
+
+# Node tooling (mermaid validation, etc.)
+node_modules/
