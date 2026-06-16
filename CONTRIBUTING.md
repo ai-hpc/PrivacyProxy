@@ -48,7 +48,7 @@ cargo clippy --all-targets -- -D warnings
 `ARCHITECTURE.md` is diagram-heavy and every Mermaid block must parse against the real engine. Before submitting documentation changes:
 
 ```bash
-npm i mermaid jsdom                          # one-time, in a scratch dir
+npm i mermaid jsdom                          # in the repo root; node_modules is git-ignored
 node scripts/check-mermaid.mjs ARCHITECTURE.md
 ```
 
