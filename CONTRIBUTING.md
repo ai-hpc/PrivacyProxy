@@ -74,4 +74,4 @@ The script exits non-zero and prints the offending block + parser error if any d
 
 ## License
 
-This project does not yet ship a `LICENSE`; one will be added before the first release. By contributing, you agree that your contributions will be licensed under the license the project adopts.
+PrivacyProxy is released under the [MIT License](LICENSE). By contributing, you agree that your contributions will be licensed under the same terms.
