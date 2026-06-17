@@ -143,6 +143,7 @@ fn app(state: SharedState) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/memory", post(memory_add).get(memory_list))
+        .route("/v1/memory/export", get(memory_export))
         .route("/v1/memory/:id", delete(memory_delete))
         .with_state(state)
 }
@@ -185,6 +186,9 @@ async fn chat_completions(
                 extra: Default::default(),
             },
         );
+    }
+    for m in &injectable {
+        state.memory.record_recall(&m.id, now_ms());
     }
 
     // This request's detection floor: user vocabulary + `local_only` memory
@@ -502,6 +506,20 @@ async fn memory_delete(
     } else {
         StatusCode::NOT_FOUND.into_response()
     }
+}
+
+async fn memory_export(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if !authorized(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/markdown; charset=utf-8",
+        )],
+        state.memory.export_markdown(),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

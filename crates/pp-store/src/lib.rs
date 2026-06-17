@@ -344,6 +344,9 @@ pub struct MemoryStore {
     embedder: Option<Arc<dyn Embedder>>,
 }
 
+/// Recall count at which a memory is marked `promoted`.
+const PROMOTE_THRESHOLD: i64 = 3;
+
 fn init_memory_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS memories (
@@ -351,7 +354,10 @@ fn init_memory_schema(conn: &Connection) -> rusqlite::Result<()> {
             content       TEXT NOT NULL,
             kind          TEXT NOT NULL,
             egress_policy TEXT NOT NULL,
-            created_ms    INTEGER NOT NULL
+            created_ms    INTEGER NOT NULL,
+            recall_count  INTEGER NOT NULL DEFAULT 0,
+            accessed_ms   INTEGER NOT NULL DEFAULT 0,
+            promoted      INTEGER NOT NULL DEFAULT 0
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id UNINDEXED, content);
         CREATE TABLE IF NOT EXISTS embeddings (
@@ -359,7 +365,16 @@ fn init_memory_schema(conn: &Connection) -> rusqlite::Result<()> {
             dim       INTEGER NOT NULL,
             vector    BLOB NOT NULL
         );",
-    )
+    )?;
+    // Tolerant migration for DBs created before these columns existed.
+    for stmt in [
+        "ALTER TABLE memories ADD COLUMN recall_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE memories ADD COLUMN accessed_ms INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE memories ADD COLUMN promoted INTEGER NOT NULL DEFAULT 0",
+    ] {
+        let _ = conn.execute(stmt, []);
+    }
+    Ok(())
 }
 
 impl MemoryStore {
@@ -407,8 +422,9 @@ impl MemoryStore {
         let id: String = id_bytes.iter().map(|b| format!("{b:02x}")).collect();
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.execute(
-            "INSERT INTO memories (id, content, kind, egress_policy, created_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO memories
+             (id, content, kind, egress_policy, created_ms, recall_count, accessed_ms, promoted)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?5, 0)",
             params![id, content, kind, egress_policy.as_str(), created_ms],
         )
         .ok()?;
@@ -521,6 +537,65 @@ impl MemoryStore {
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.into_iter().take(limit).map(|(_, m)| m).collect()
+    }
+
+    /// Record that a memory was recalled: bump its count, update access time,
+    /// and promote it once it crosses [`PROMOTE_THRESHOLD`]. Returns whether the
+    /// memory is now promoted.
+    pub fn record_recall(&self, id: &str, now_ms: i64) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = conn.execute(
+            "UPDATE memories
+             SET recall_count = recall_count + 1,
+                 accessed_ms  = ?2,
+                 promoted     = CASE WHEN recall_count + 1 >= ?3 THEN 1 ELSE promoted END
+             WHERE id = ?1",
+            params![id, now_ms, PROMOTE_THRESHOLD],
+        );
+        conn.query_row(
+            "SELECT promoted FROM memories WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|p| p == 1)
+        .unwrap_or(false)
+    }
+
+    /// A human-auditable Markdown view of everything stored — promoted entries
+    /// first. `local_only` rows are labelled so it's clear they never leave the
+    /// device.
+    pub fn export_markdown(&self) -> String {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT content, kind, egress_policy, recall_count, promoted
+             FROM memories ORDER BY promoted DESC, recall_count DESC, created_ms DESC",
+        ) else {
+            return String::new();
+        };
+        let rows: Vec<(String, String, String, i64, i64)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+            .unwrap_or_default();
+
+        let mut out = String::from(
+            "# PrivacyProxy memory\n\nAuditable view of what the gateway remembers. \
+             `local_only` entries never leave the device.\n\n",
+        );
+        for (content, kind, policy, recalls, promoted) in rows {
+            let star = if promoted == 1 { "* " } else { "" };
+            out.push_str(&format!(
+                "- {star}{content}  _({kind}, {policy}, recalled {recalls}x)_\n"
+            ));
+        }
+        out
     }
 }
 
@@ -718,6 +793,23 @@ mod tests {
             .add("x", "fact", EgressPolicy::Anonymized, 1)
             .expect("add");
         assert!(plain.semantic_recall("x", 3).is_empty());
+    }
+
+    #[test]
+    fn recall_tracking_promotion_and_markdown_export() {
+        let m = MemoryStore::in_memory().expect("mem");
+        let mem = m
+            .add("User likes jazz", "preference", EgressPolicy::Anonymized, 1)
+            .expect("add");
+        assert!(!m.record_recall(&mem.id, 10)); // count 1
+        assert!(!m.record_recall(&mem.id, 11)); // count 2
+        assert!(m.record_recall(&mem.id, 12)); // count 3 -> promoted
+
+        let md = m.export_markdown();
+        assert!(md.contains("# PrivacyProxy memory"));
+        assert!(md.contains("User likes jazz"));
+        assert!(md.contains("recalled 3x"));
+        assert!(md.contains("* "), "promoted entries are starred");
     }
 
     #[test]
