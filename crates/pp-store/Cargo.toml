@@ -8,3 +8,6 @@ repository.workspace = true
 [dependencies]
 pp-core = { path = "../pp-core" }
 rusqlite = { version = "0.32", features = ["bundled"] }
+aes-gcm = "0.10"
+sha2 = "0.10"
+getrandom = "0.2"

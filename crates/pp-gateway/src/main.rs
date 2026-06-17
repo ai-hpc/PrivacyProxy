@@ -82,12 +82,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Durable personal vault. `:memory:` (or unset → a local file) keeps known
     // vocabulary mapped to stable placeholders across restarts.
     let db = env::var("PRIVACYPROXY_DB").unwrap_or_else(|_| "privacyproxy.db".to_string());
+    let db_key = env::var("PRIVACYPROXY_DB_KEY")
+        .ok()
+        .filter(|k| !k.is_empty());
     let personal: Arc<dyn Vault> = Arc::new(if db == ":memory:" {
         SqliteVault::in_memory()?
     } else {
-        SqliteVault::open(&db)?
+        SqliteVault::open_with_key(&db, db_key.as_deref())?
     });
-    tracing::info!("personal vault: {db}");
+    tracing::info!(encrypted = db_key.is_some(), "personal vault: {db}");
 
     let vocab = parse_vocab();
 
@@ -304,13 +307,27 @@ fn default_models() -> RouterConfig {
     }
 }
 
-/// Parse the user's private vocabulary from `PRIVACYPROXY_VOCAB` (comma-separated).
+/// Parse the user's private vocabulary from `PRIVACYPROXY_VOCAB` (comma-separated)
+/// and/or `PRIVACYPROXY_VOCAB_FILE` (one term per line; `#` comments ignored).
 fn parse_vocab() -> Vec<(String, EntityKind)> {
-    env::var("PRIVACYPROXY_VOCAB")
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
+    let env_csv = env::var("PRIVACYPROXY_VOCAB").unwrap_or_default();
+    let file = env::var("PRIVACYPROXY_VOCAB_FILE").ok().and_then(|p| {
+        std::fs::read_to_string(&p)
+            .map_err(|e| tracing::warn!("could not read PRIVACYPROXY_VOCAB_FILE {p}: {e}"))
+            .ok()
+    });
+    vocab_terms(&env_csv, file.as_deref())
+}
+
+/// Pure vocabulary parser: comma-separated env value plus optional file contents
+/// (one term per line). Trims, drops blanks and `#` comment lines.
+fn vocab_terms(env_csv: &str, file_contents: Option<&str>) -> Vec<(String, EntityKind)> {
+    let env_terms = env_csv.split(',');
+    let file_terms = file_contents.into_iter().flat_map(|c| c.lines());
+    env_terms
+        .chain(file_terms)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.starts_with('#'))
         .map(|s| (s.to_string(), EntityKind::Custom("private".to_string())))
         .collect()
 }
@@ -334,4 +351,28 @@ fn gather_text(req: &ChatRequest) -> String {
         .filter_map(|m| m.content.as_deref())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vocab_from_env_and_file() {
+        let v = vocab_terms(
+            "Falcon, Acme Corp",
+            Some("# my projects\nMercury\n\n  Apollo  \n"),
+        );
+        let terms: Vec<&str> = v.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(terms, vec!["Falcon", "Acme Corp", "Mercury", "Apollo"]);
+        assert!(v
+            .iter()
+            .all(|(_, k)| matches!(k, EntityKind::Custom(s) if s == "private")));
+    }
+
+    #[test]
+    fn vocab_empty_inputs() {
+        assert!(vocab_terms("", None).is_empty());
+        assert!(vocab_terms("  ,  ", None).is_empty());
+    }
 }

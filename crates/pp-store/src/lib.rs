@@ -11,8 +11,12 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
+use aes_gcm::aead::generic_array::GenericArray;
+use aes_gcm::aead::Aead;
+use aes_gcm::{Aes256Gcm, Key, KeyInit};
 use pp_core::{EntityKind, Placeholder, Vault};
 use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // MemVault — in-memory, deterministic, ephemeral.
@@ -76,24 +80,28 @@ impl Vault for MemVault {
 // SqliteVault — durable, persistent across runs.
 // ---------------------------------------------------------------------------
 
-/// SQLite-backed deterministic vault. Intended for the **durable personal
-/// layer** — reversible entities (your private vocabulary) that should keep a
-/// stable placeholder across restarts.
+/// SQLite-backed deterministic vault for the **durable personal layer** —
+/// reversible entities (your private vocabulary) that keep a stable placeholder
+/// across restarts. Not for secrets (route those to a redact-only ephemeral
+/// vault).
 ///
-/// Not intended for secrets: route those to a redact-only ephemeral vault.
-/// Originals are stored as plaintext in the local DB (encryption at rest is a
-/// follow-up); the file is local-only and git-ignored.
+/// With a key (see [`SqliteVault::open_with_key`]) stored originals are
+/// encrypted at rest with AES-256-GCM, and the lookup column is a keyed hash so
+/// rows still dedupe without revealing plaintext. Without a key, originals are
+/// stored in plaintext (the file is local-only and git-ignored).
 pub struct SqliteVault {
     conn: Mutex<Connection>,
+    cipher: Option<VaultCipher>,
 }
 
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS mappings (
             tag         TEXT NOT NULL,
-            original    TEXT NOT NULL,
+            lookup      TEXT NOT NULL,
+            secret      BLOB NOT NULL,
             placeholder TEXT NOT NULL,
-            PRIMARY KEY (tag, original)
+            PRIMARY KEY (tag, lookup)
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_placeholder ON mappings(placeholder);
         CREATE TABLE IF NOT EXISTS counters (
@@ -104,49 +112,83 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 impl SqliteVault {
-    /// Open (creating if absent) a vault at `path`.
+    /// Open (creating if absent) an unencrypted vault at `path`.
     pub fn open(path: &str) -> rusqlite::Result<Self> {
+        Self::open_with_key(path, None)
+    }
+
+    /// Open a vault at `path`, encrypting originals at rest when `key` is `Some`.
+    pub fn open_with_key(path: &str, key: Option<&str>) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
         init_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            cipher: key.map(VaultCipher::derive),
         })
     }
 
-    /// An ephemeral in-memory SQLite vault (mainly for tests).
+    /// An ephemeral in-memory vault (mainly for tests).
     pub fn in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         init_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            cipher: None,
         })
     }
 
-    fn try_intern(&self, tag: &str, original: &str) -> rusqlite::Result<Placeholder> {
+    /// Dedup key for `(tag, original)`: the plaintext original when unencrypted,
+    /// else a keyed hash that never reveals it.
+    fn lookup_key(&self, tag: &str, original: &str) -> String {
+        match &self.cipher {
+            Some(c) => c.lookup(tag, original),
+            None => original.to_string(),
+        }
+    }
+
+    fn seal(&self, original: &str) -> Result<Vec<u8>, ()> {
+        match &self.cipher {
+            Some(c) => c.seal(original),
+            None => Ok(original.as_bytes().to_vec()),
+        }
+    }
+
+    fn unseal(&self, secret: &[u8]) -> Option<String> {
+        match &self.cipher {
+            Some(c) => c.open(secret),
+            None => String::from_utf8(secret.to_vec()).ok(),
+        }
+    }
+
+    fn try_intern(&self, tag: &str, original: &str) -> Result<Placeholder, ()> {
+        let lookup = self.lookup_key(tag, original);
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         if let Ok(existing) = conn.query_row(
-            "SELECT placeholder FROM mappings WHERE tag = ?1 AND original = ?2",
-            params![tag, original],
+            "SELECT placeholder FROM mappings WHERE tag = ?1 AND lookup = ?2",
+            params![tag, lookup],
             |row| row.get::<_, String>(0),
         ) {
             return Ok(Placeholder(existing));
         }
+        let secret = self.seal(original)?;
         let n: i64 = conn
             .query_row("SELECT n FROM counters WHERE tag = ?1", params![tag], |r| {
                 r.get(0)
             })
             .unwrap_or(0)
             + 1;
+        let placeholder = format!("__{tag}_{n}__");
         conn.execute(
             "INSERT INTO counters (tag, n) VALUES (?1, ?2)
              ON CONFLICT(tag) DO UPDATE SET n = excluded.n",
             params![tag, n],
-        )?;
-        let placeholder = format!("__{tag}_{n}__");
+        )
+        .map_err(|_| ())?;
         conn.execute(
-            "INSERT INTO mappings (tag, original, placeholder) VALUES (?1, ?2, ?3)",
-            params![tag, original, placeholder],
-        )?;
+            "INSERT INTO mappings (tag, lookup, secret, placeholder) VALUES (?1, ?2, ?3, ?4)",
+            params![tag, lookup, secret, placeholder],
+        )
+        .map_err(|_| ())?;
         Ok(Placeholder(placeholder))
     }
 }
@@ -155,8 +197,8 @@ impl Vault for SqliteVault {
     fn intern(&self, original: &str, kind: &EntityKind) -> Placeholder {
         let tag = kind.tag();
         self.try_intern(&tag, original).unwrap_or_else(|_| {
-            // Degraded mode (DB error): a deterministic, *unpersisted* token.
-            // Because it isn't stored, resolve() returns None and the value
+            // Degraded mode (DB or crypto error): a deterministic, *unpersisted*
+            // token. Since it isn't stored, resolve() returns None and the value
             // stays anonymised — fail toward privacy.
             let mut h = std::collections::hash_map::DefaultHasher::new();
             (tag.as_str(), original).hash(&mut h);
@@ -165,14 +207,88 @@ impl Vault for SqliteVault {
     }
 
     fn resolve(&self, placeholder: &str) -> Option<String> {
-        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        conn.query_row(
-            "SELECT original FROM mappings WHERE placeholder = ?1",
-            params![placeholder],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
+        let secret: Vec<u8> = {
+            let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.query_row(
+                "SELECT secret FROM mappings WHERE placeholder = ?1",
+                params![placeholder],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .ok()?
+        };
+        self.unseal(&secret)
     }
+}
+
+/// AES-256-GCM encryption + keyed-hash lookup for at-rest protection.
+struct VaultCipher {
+    aes: Aes256Gcm,
+    mac_key: [u8; 32],
+}
+
+impl VaultCipher {
+    fn derive(passphrase: &str) -> Self {
+        let enc = subkey(b"pp-enc-v1", passphrase);
+        Self {
+            aes: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&enc)),
+            mac_key: subkey(b"pp-mac-v1", passphrase),
+        }
+    }
+
+    /// Deterministic, non-reversible lookup key (keyed SHA-256, hex).
+    fn lookup(&self, tag: &str, original: &str) -> String {
+        let digest = Sha256::new()
+            .chain_update(self.mac_key)
+            .chain_update(tag.as_bytes())
+            .chain_update([0x1f])
+            .chain_update(original.as_bytes())
+            .finalize();
+        hex(&digest)
+    }
+
+    fn seal(&self, plaintext: &str) -> Result<Vec<u8>, ()> {
+        let mut nonce = [0u8; 12];
+        getrandom::getrandom(&mut nonce).map_err(|_| ())?;
+        let ciphertext = self
+            .aes
+            .encrypt(GenericArray::from_slice(&nonce), plaintext.as_bytes())
+            .map_err(|_| ())?;
+        let mut out = nonce.to_vec();
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    fn open(&self, blob: &[u8]) -> Option<String> {
+        if blob.len() < 12 {
+            return None;
+        }
+        let (nonce, ciphertext) = blob.split_at(12);
+        let plaintext = self
+            .aes
+            .decrypt(GenericArray::from_slice(nonce), ciphertext)
+            .ok()?;
+        String::from_utf8(plaintext).ok()
+    }
+}
+
+/// SHA-256 of `domain || passphrase`, as a 32-byte subkey.
+fn subkey(domain: &[u8], passphrase: &str) -> [u8; 32] {
+    let digest = Sha256::new()
+        .chain_update(domain)
+        .chain_update(passphrase.as_bytes())
+        .finalize();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&digest);
+    key
+}
+
+/// Lower-case hex encoding.
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +389,39 @@ mod tests {
                 "__PRIVATE_1__"
             );
             assert_eq!(v.resolve("__PRIVATE_1__").as_deref(), Some("Falcon"));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sqlite_encrypts_originals_at_rest() {
+        let path = std::env::temp_dir().join("pp_store_encryption_test.db");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_str().expect("utf-8 path");
+        {
+            let v = SqliteVault::open_with_key(p, Some("correct horse")).expect("open");
+            assert_eq!(
+                v.intern("Falcon", &EntityKind::Custom("private".into()))
+                    .as_str(),
+                "__PRIVATE_1__"
+            );
+            assert_eq!(v.resolve("__PRIVATE_1__").as_deref(), Some("Falcon"));
+        }
+        // The plaintext must not appear anywhere in the raw DB file.
+        let raw = std::fs::read(&path).expect("read db");
+        assert!(
+            !raw.windows(6).any(|w| w == b"Falcon"),
+            "plaintext leaked to disk"
+        );
+        {
+            // Reopening with the key still resolves and keeps a stable token.
+            let v = SqliteVault::open_with_key(p, Some("correct horse")).expect("reopen");
+            assert_eq!(v.resolve("__PRIVATE_1__").as_deref(), Some("Falcon"));
+            assert_eq!(
+                v.intern("Falcon", &EntityKind::Custom("private".into()))
+                    .as_str(),
+                "__PRIVATE_1__"
+            );
         }
         let _ = std::fs::remove_file(&path);
     }
