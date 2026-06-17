@@ -7,3 +7,4 @@ repository.workspace = true
 
 [dependencies]
 pp-core = { path = "../pp-core" }
+rusqlite = { version = "0.32", features = ["bundled"] }

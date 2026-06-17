@@ -26,7 +26,7 @@ use pp_anonymize::egress_guard;
 use pp_core::{Detector, EntityKind, Vault};
 use pp_detect::{EmailRecognizer, Ensemble, EntropyRecognizer, GazetteerRecognizer};
 use pp_protocol::ChatRequest;
-use pp_store::MemVault;
+use pp_store::{LayeredVault, MemVault, SqliteVault};
 use pp_upstream::{
     ByteStream, ModelEntry, OpenRouterProvider, Provider, ProviderError, RouterConfig,
 };
@@ -39,6 +39,8 @@ struct AppState {
     /// Precise re-detection (no entropy) for the egress guard.
     guard: Ensemble,
     provider: Arc<dyn Provider>,
+    /// Durable personal vault (SQLite), shared across requests.
+    personal: Arc<dyn Vault>,
     /// If set, clients must present `Authorization: Bearer <key>`.
     local_key: Option<String>,
 }
@@ -72,10 +74,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let provider: Arc<dyn Provider> =
         Arc::new(OpenRouterProvider::new(openrouter_key, default_models()));
+
+    // Durable personal vault. `:memory:` (or unset → a local file) keeps known
+    // vocabulary mapped to stable placeholders across restarts.
+    let db = env::var("PRIVACYPROXY_DB").unwrap_or_else(|_| "privacyproxy.db".to_string());
+    let personal: Arc<dyn Vault> = Arc::new(if db == ":memory:" {
+        SqliteVault::in_memory()?
+    } else {
+        SqliteVault::open(&db)?
+    });
+    tracing::info!("personal vault: {db}");
+
     let state = Arc::new(AppState {
         anonymizer: build_ensemble(true),
         guard: build_ensemble(false),
         provider,
+        personal,
         local_key,
     });
 
@@ -101,9 +115,13 @@ async fn chat_completions(
         return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
     }
 
-    // Per-request vault (Arc so it can move into the streaming task). Placeholders
-    // are consistent within the request and never leak to the client.
-    let vault: Arc<dyn Vault> = Arc::new(MemVault::new());
+    // Per-request vault: durable personal layer (shared) + a fresh ephemeral
+    // session layer. Placeholders are consistent within the request and never
+    // leak to the client; known vocabulary stays stable across runs.
+    let vault: Arc<dyn Vault> = Arc::new(LayeredVault::new(
+        state.personal.clone(),
+        Arc::new(MemVault::new()),
+    ));
     let audit = pipeline::anonymize_request(&mut req, &state.anonymizer, &*vault);
     let needs_tools = req.has_tools();
     let streaming = req.stream == Some(true);
