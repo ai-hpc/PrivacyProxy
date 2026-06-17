@@ -101,12 +101,14 @@ export PRIVACYPROXY_LLM_URL=http://127.0.0.1:8081
 | `PRIVACYPROXY_DB` | durable vault path (`:memory:` for ephemeral) | `privacyproxy.db` |
 | `PRIVACYPROXY_LLM_URL` | local OpenAI-compatible endpoint for semantic detection | unset (off) |
 | `PRIVACYPROXY_LLM_MODEL` | model name for the semantic detector | `falcon-h1-0.5b-instruct` |
+| `PRIVACYPROXY_DB_KEY` | passphrase to encrypt the durable vault at rest (AES-256-GCM) | unset (plaintext) |
+| `PRIVACYPROXY_VOCAB_FILE` | file of vocabulary terms, one per line (`#` comments) | unset |
 
 ## Limitations (honest)
 
 - **Structural tool fields** (function names, parameter keys) aren't anonymized — they can't carry the placeholder sentinel. If one contains PII, the egress guard **blocks** the request (fail-closed) rather than leak it.
 - **The guarantee is the deterministic floor** (vocabulary + email + secrets). The optional local LLM adds best-effort recall but isn't part of the guarantee, and its quality depends on the model you run. A dedicated ONNX in-process NER is a future backend behind the same seam.
-- **Two-layer vault** — known vocabulary persists durably (SQLite); emails/secrets/discovered entities are ephemeral per request. Originals are stored as plaintext in the local DB (git-ignored); encryption at rest is a follow-up.
+- **Two-layer vault** — known vocabulary persists durably (SQLite); emails/secrets/discovered entities are ephemeral per request. Stored originals can be **encrypted at rest** (AES-256-GCM) by setting `PRIVACYPROXY_DB_KEY`; otherwise they're plaintext in the local (git-ignored) DB.
 - **Output quality** ≈ free-model ceiling × context surviving anonymization. Coding and agent work fit best, since logic and structure survive masking.
 
 ## Project layout
