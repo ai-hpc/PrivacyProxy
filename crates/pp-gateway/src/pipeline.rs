@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use pp_anonymize::{anonymize, rehydrate, StreamRehydrator};
 use pp_core::{Redaction, Vault};
 use pp_detect::Ensemble;
-use pp_protocol::ChatRequest;
+use pp_protocol::{ChatRequest, Content};
 use serde_json::{json, Value};
 
 /// Anonymise `*value` in place, appending any redactions to `audit`.
@@ -69,8 +69,18 @@ pub fn anonymize_request(
     let mut audit = Vec::new();
 
     for msg in &mut req.messages {
-        if let Some(content) = msg.content.as_mut() {
-            anon_into(content, ensemble, vault, &mut audit);
+        match msg.content.as_mut() {
+            Some(Content::Text(s)) => anon_into(s, ensemble, vault, &mut audit),
+            // Multimodal: anonymise the text of each text part; other parts
+            // (e.g. image_url) pass through and stay subject to the egress guard.
+            Some(Content::Parts(parts)) => {
+                for part in parts.iter_mut() {
+                    if let Some(Value::String(t)) = part.get_mut("text") {
+                        anon_into(t, ensemble, vault, &mut audit);
+                    }
+                }
+            }
+            None => {}
         }
         // Assistant tool-call arguments carry real values from prior turns.
         if let Some(tool_calls) = msg
@@ -206,7 +216,11 @@ mod tests {
         .expect("valid request");
         anonymize_request(&mut req, &floor(), &vault);
         assert_eq!(
-            req.messages[0].content.as_deref(),
+            req.messages[0]
+                .content
+                .as_ref()
+                .map(Content::text)
+                .as_deref(),
             Some("Hello __PROJECT_1__")
         );
 
@@ -253,6 +267,37 @@ mod tests {
         assert!(
             body.contains("read_file"),
             "function name should be untouched"
+        );
+    }
+
+    #[test]
+    fn anonymizes_multimodal_text_parts_only() {
+        let vault = MemVault::new();
+        let mut req: ChatRequest = serde_json::from_value(json!({
+            "model": "x",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look at Falcon"},
+                    {"type": "image_url", "image_url": {"url": "https://host/Falcon.png"}}
+                ]
+            }]
+        }))
+        .expect("array content must deserialize, not 422");
+
+        anonymize_request(&mut req, &floor(), &vault);
+        let body = serde_json::to_value(&req).expect("serialise").to_string();
+
+        // The text part is anonymised …
+        assert!(
+            body.contains("__PROJECT_1__"),
+            "text part not masked: {body}"
+        );
+        assert!(!body.contains("look at Falcon"), "text leaked: {body}");
+        // … the structural image_url part is preserved verbatim.
+        assert!(
+            body.contains("https://host/Falcon.png"),
+            "image part should pass through: {body}"
         );
     }
 

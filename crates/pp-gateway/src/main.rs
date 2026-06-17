@@ -28,7 +28,7 @@ use pp_detect::{
     EmailRecognizer, Ensemble, EntropyRecognizer, GazetteerRecognizer, LocalLlmRecognizer,
     RegexRecognizer,
 };
-use pp_protocol::{ChatRequest, Message};
+use pp_protocol::{ChatRequest, Content, Message};
 use pp_store::{HashEmbedder, LayeredVault, MemVault, MemoryStore, SqliteVault};
 use pp_upstream::{
     ByteStream, ModelEntry, OpenRouterProvider, Provider, ProviderError, RouterConfig,
@@ -39,8 +39,6 @@ use serde_json::{json, Value};
 struct AppState {
     /// User private vocabulary (parsed once); the gazetteer is built per request.
     vocab: Vec<(String, EntityKind)>,
-    /// Precise re-detection (no entropy) for the egress guard.
-    guard: Ensemble,
     provider: Arc<dyn Provider>,
     /// Durable personal vault (SQLite), shared across requests.
     personal: Arc<dyn Vault>,
@@ -124,7 +122,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
     let state = Arc::new(AppState {
-        guard: build_guard(&vocab),
         vocab,
         provider,
         personal,
@@ -183,7 +180,7 @@ async fn chat_completions(
             0,
             Message {
                 role: "system".to_string(),
-                content: Some(block),
+                content: Some(Content::Text(block)),
                 extra: Default::default(),
             },
         );
@@ -203,6 +200,11 @@ async fn chat_completions(
             .into_iter()
             .map(|t| (t, EntityKind::Custom("private".to_string()))),
     );
+    // Egress guard for THIS request: the same precise identifier set the floor
+    // uses (vocab + `local_only` memory terms) minus the high-recall entropy
+    // detector. Building it per request keeps it in lock-step with the floor, so
+    // a private term that surfaces in an un-rewritten field fails closed.
+    let guard = build_guard(&terms);
     let mut detectors: Vec<Box<dyn Detector>> = Vec::new();
     if !terms.is_empty() {
         detectors.push(Box::new(GazetteerRecognizer::new(terms)));
@@ -235,7 +237,7 @@ async fn chat_completions(
     };
 
     // Fail closed if anything sensitive survived into an un-rewritten field.
-    if let Err(leaks) = egress_guard(&sanitized.to_string(), &state.guard) {
+    if let Err(leaks) = egress_guard(&sanitized.to_string(), &guard) {
         tracing::error!(
             count = leaks.len(),
             "egress guard tripped — blocking request"
@@ -407,10 +409,11 @@ fn build_guard(vocab: &[(String, EntityKind)]) -> Ensemble {
 }
 
 /// All message text content joined — the input to recall and the local detector.
+/// For multimodal messages this is the concatenated text of the text parts.
 fn gather_text(req: &ChatRequest) -> String {
     req.messages
         .iter()
-        .filter_map(|m| m.content.as_deref())
+        .filter_map(|m| m.content.as_ref().map(Content::text))
         .collect::<Vec<_>>()
         .join("\n")
 }
