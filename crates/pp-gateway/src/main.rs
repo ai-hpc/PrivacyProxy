@@ -257,6 +257,9 @@ async fn chat_completions(
         streaming,
         "forwarding sanitised request"
     );
+    // Post-guard, so this contains no detected sensitive data — safe to log.
+    // Gives operators a way to inspect exactly what crosses the cloud boundary.
+    tracing::debug!(payload = %sanitized, "egress payload (anonymised)");
 
     if streaming {
         match state.provider.chat_stream(&sanitized, needs_tools).await {
