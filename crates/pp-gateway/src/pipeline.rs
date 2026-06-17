@@ -58,7 +58,7 @@ fn anonymize_descriptions(
 /// only — never plaintext).
 ///
 /// Structural tool fields (function/parameter *names*, enum values) are left
-/// untouched: they can't carry the `⟦…⟧` sentinel (function-name charset), and
+/// untouched: they can't carry the `__…__` sentinel (function-name charset), and
 /// the egress guard fail-closes if any of them happen to contain detectable
 /// PII — so such requests are blocked, never leaked.
 pub fn anonymize_request(
@@ -101,7 +101,7 @@ pub fn anonymize_request(
 pub fn rehydrate_response(value: &mut Value, vault: &dyn Vault) {
     match value {
         Value::String(s) => {
-            if s.contains('⟦') {
+            if s.contains("__") {
                 *s = rehydrate(s, vault);
             }
         }
@@ -207,11 +207,11 @@ mod tests {
         anonymize_request(&mut req, &floor(), &vault);
         assert_eq!(
             req.messages[0].content.as_deref(),
-            Some("Hello ⟦PROJECT_1⟧")
+            Some("Hello __PROJECT_1__")
         );
 
         let mut resp = json!({
-            "choices": [{ "message": { "role": "assistant", "content": "Hi ⟦PROJECT_1⟧!" } }]
+            "choices": [{ "message": { "role": "assistant", "content": "Hi __PROJECT_1__!" } }]
         });
         rehydrate_response(&mut resp, &vault);
         assert_eq!(
@@ -249,7 +249,7 @@ mod tests {
         let body = serde_json::to_value(&req).expect("serialise").to_string();
 
         assert!(!body.contains("Falcon"), "Falcon leaked: {body}");
-        assert!(body.contains("⟦PROJECT_1⟧"), "no placeholder: {body}");
+        assert!(body.contains("__PROJECT_1__"), "no placeholder: {body}");
         assert!(
             body.contains("read_file"),
             "function name should be untouched"
@@ -259,14 +259,14 @@ mod tests {
     #[test]
     fn streaming_rehydrates_content_across_chunks() {
         let vault = MemVault::new();
-        vault.intern("Falcon", &EntityKind::Custom("project".into())); // ⟦PROJECT_1⟧
+        vault.intern("Falcon", &EntityKind::Custom("project".into())); // __PROJECT_1__
         let mut state = StreamState::default();
 
-        let mut c1 = json!({"choices":[{"index":0,"delta":{"content":"Hi ⟦PROJ"}}]});
+        let mut c1 = json!({"choices":[{"index":0,"delta":{"content":"Hi __PROJ"}}]});
         rehydrate_deltas(&mut c1, &mut state, &vault);
         assert_eq!(c1["choices"][0]["delta"]["content"], json!("Hi "));
 
-        let mut c2 = json!({"choices":[{"index":0,"delta":{"content":"ECT_1⟧!"}}]});
+        let mut c2 = json!({"choices":[{"index":0,"delta":{"content":"ECT_1__!"}}]});
         rehydrate_deltas(&mut c2, &mut state, &vault);
         assert_eq!(c2["choices"][0]["delta"]["content"], json!("Falcon!"));
     }
@@ -274,11 +274,11 @@ mod tests {
     #[test]
     fn streaming_rehydrates_tool_call_arguments_across_chunks() {
         let vault = MemVault::new();
-        vault.intern("Falcon", &EntityKind::Custom("project".into())); // ⟦PROJECT_1⟧
+        vault.intern("Falcon", &EntityKind::Custom("project".into())); // __PROJECT_1__
         let mut state = StreamState::default();
 
         let mut c1 = json!({"choices":[{"index":0,"delta":{"tool_calls":[
-            {"index":0,"function":{"arguments":"{\"path\":\"⟦PROJ"}}
+            {"index":0,"function":{"arguments":"{\"path\":\"__PROJ"}}
         ]}}]});
         rehydrate_deltas(&mut c1, &mut state, &vault);
         assert_eq!(
@@ -287,7 +287,7 @@ mod tests {
         );
 
         let mut c2 = json!({"choices":[{"index":0,"delta":{"tool_calls":[
-            {"index":0,"function":{"arguments":"ECT_1⟧.md\"}"}}
+            {"index":0,"function":{"arguments":"ECT_1__.md\"}"}}
         ]}}]});
         rehydrate_deltas(&mut c2, &mut state, &vault);
         assert_eq!(

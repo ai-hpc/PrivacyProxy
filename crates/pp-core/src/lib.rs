@@ -36,7 +36,7 @@ pub enum SecretClass {
 }
 
 impl EntityKind {
-    /// Upper-case tag used in placeholders, e.g. the `PERSON` in `⟦PERSON_1⟧`.
+    /// Upper-case tag used in placeholders, e.g. the `PERSON` in `__PERSON_1__`.
     pub fn tag(&self) -> String {
         match self {
             EntityKind::Person => "PERSON".into(),
@@ -70,7 +70,7 @@ pub struct Entity {
     pub source: DetectorId,
 }
 
-/// An anonymous token that replaces an original value, e.g. `⟦PERSON_1⟧`.
+/// An anonymous token that replaces an original value, e.g. `__PERSON_1__`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Placeholder(pub String);
 

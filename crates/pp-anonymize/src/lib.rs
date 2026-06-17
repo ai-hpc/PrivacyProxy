@@ -45,27 +45,28 @@ pub fn anonymize(text: &str, ensemble: &Ensemble, vault: &dyn Vault) -> Anonymiz
 /// Inbound batch transform: restore placeholders the vault still maps.
 /// Unresolved tokens (e.g. redact-only secrets) are passed through untouched.
 pub fn rehydrate(text: &str, vault: &dyn Vault) -> String {
-    const OPEN: char = '⟦';
-    const CLOSE: char = '⟧';
+    const D: &str = "__";
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(open) = rest.find(OPEN) {
+    loop {
+        let Some(open) = rest.find(D) else { break };
+        let content_start = open + D.len();
+        let Some(rel) = rest[content_start..].find(D) else {
+            break;
+        };
+        let end = content_start + rel + D.len();
+        let token = &rest[open..end];
         out.push_str(&rest[..open]);
-        let after = &rest[open..];
-        match after.find(CLOSE) {
-            Some(close_rel) => {
-                let end = close_rel + CLOSE.len_utf8();
-                let ph = &after[..end];
-                match vault.resolve(ph) {
-                    Some(original) => out.push_str(&original),
-                    None => out.push_str(ph),
-                }
-                rest = &after[end..];
+        match vault.resolve(token) {
+            Some(original) => {
+                out.push_str(&original);
+                rest = &rest[end..];
             }
             None => {
-                out.push_str(after);
-                rest = "";
-                break;
+                // Not a known placeholder: emit the opening "__" and rescan
+                // (its trailing "__" may open a real one).
+                out.push_str(D);
+                rest = &rest[content_start..];
             }
         }
     }
@@ -91,10 +92,10 @@ pub fn egress_guard(sanitized: &str, guard: &Ensemble) -> Result<(), Vec<Entity>
 }
 
 /// Streaming rehydrator: feed response text fragments through [`push`]; any
-/// trailing partial placeholder (a `⟦…` with no closing `⟧` yet) is withheld
+/// trailing partial placeholder (a `__…` with no closing `__` yet) is withheld
 /// in `carry` until a later fragment completes it. This is the carry-buffer
 /// state machine from `ARCHITECTURE.md` §10 — without it, a placeholder split
-/// across SSE chunks (`⟦PER` | `SON_1⟧`) would be emitted broken.
+/// across SSE chunks (`__PER` | `SON_1__`) would be emitted broken.
 ///
 /// Each fragment must be valid UTF-8 (it is — it arrives as a parsed JSON
 /// string), so this operates at the `char`/`str` level, not raw bytes.
@@ -116,32 +117,43 @@ impl StreamRehydrator {
         self.carry.push_str(fragment);
         let mut out = String::new();
         loop {
-            let Some(open) = self.carry.find('⟦') else {
-                out.push_str(&self.carry);
-                self.carry.clear();
+            let Some(open) = self.carry.find("__") else {
                 break;
             };
-            match self.carry[open..].find('⟧') {
+            let content_start = open + 2;
+            match self.carry[content_start..].find("__") {
                 Some(rel) => {
-                    let end = open + rel + '⟧'.len_utf8();
-                    let before = self.carry[..open].to_string();
-                    let placeholder = self.carry[open..end].to_string();
-                    let remainder = self.carry[end..].to_string();
-                    out.push_str(&before);
-                    match vault.resolve(&placeholder) {
-                        Some(original) => out.push_str(&original),
-                        None => out.push_str(&placeholder),
+                    let end = content_start + rel + 2;
+                    let token = self.carry[open..end].to_string();
+                    out.push_str(&self.carry[..open]);
+                    match vault.resolve(&token) {
+                        Some(original) => {
+                            out.push_str(&original);
+                            self.carry.replace_range(..end, "");
+                        }
+                        None => {
+                            // Not ours: emit the opening "__" and rescan after it.
+                            out.push_str("__");
+                            self.carry.replace_range(..content_start, "");
+                        }
                     }
-                    self.carry = remainder;
                 }
                 None => {
-                    // Incomplete placeholder: emit the safe prefix, hold the rest.
-                    let before = self.carry[..open].to_string();
-                    out.push_str(&before);
-                    self.carry = self.carry[open..].to_string();
-                    break;
+                    // Partial placeholder from `open`: emit the prefix, hold the rest.
+                    out.push_str(&self.carry[..open]);
+                    self.carry.replace_range(..open, "");
+                    return out;
                 }
             }
+        }
+        // No "__" remains; hold a lone trailing '_' that could begin "__" next.
+        if self.carry.ends_with('_') {
+            let keep = self.carry.len() - 1;
+            out.push_str(&self.carry[..keep]);
+            self.carry.replace_range(..keep, "");
+        } else {
+            out.push_str(&self.carry);
+            self.carry.clear();
         }
         out
     }
@@ -200,12 +212,12 @@ mod tests {
     fn stream_rehydrates_split_placeholder() {
         let vault = MemVault::new();
         let ph = vault.intern("Alex", &EntityKind::Person);
-        assert_eq!(ph.as_str(), "⟦PERSON_1⟧");
+        assert_eq!(ph.as_str(), "__PERSON_1__");
 
         let mut r = StreamRehydrator::new();
         let mut out = String::new();
-        out.push_str(&r.push("Hi ⟦PER", &vault)); // emits "Hi ", holds "⟦PER"
-        out.push_str(&r.push("SON_1⟧!", &vault)); // completes → "Alex!"
+        out.push_str(&r.push("Hi __PER", &vault)); // emits "Hi ", holds "__PER"
+        out.push_str(&r.push("SON_1__!", &vault)); // completes → "Alex!"
         out.push_str(&r.flush(&vault));
         assert_eq!(out, "Hi Alex!");
     }
@@ -216,8 +228,8 @@ mod tests {
         let mut r = StreamRehydrator::new();
         assert_eq!(r.push("hello world", &vault), "hello world");
         // A lone opening sentinel is withheld until completion …
-        assert_eq!(r.push("tail ⟦PER", &vault), "tail ");
+        assert_eq!(r.push("tail __PER", &vault), "tail ");
         // … and flushed verbatim if it never completes.
-        assert_eq!(r.flush(&vault), "⟦PER");
+        assert_eq!(r.flush(&vault), "__PER");
     }
 }

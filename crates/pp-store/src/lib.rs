@@ -13,7 +13,7 @@ use pp_core::{EntityKind, Placeholder, Vault};
 /// In-memory deterministic vault.
 ///
 /// * `intern` is deterministic per `(tag, original)`.
-/// * Secrets are **redact-only**: they get a stable `⟦SECRET_n⟧` placeholder
+/// * Secrets are **redact-only**: they get a stable `__SECRET_n__` placeholder
 ///   but no reverse mapping, so [`Vault::resolve`] never restores them.
 #[derive(Default)]
 pub struct MemVault {
@@ -51,7 +51,7 @@ impl Vault for MemVault {
             *c += 1;
             *c
         };
-        let ph = Placeholder(format!("⟦{tag}_{n}⟧"));
+        let ph = Placeholder(format!("__{tag}_{n}__"));
         inner.forward.insert(key, ph.clone());
         if !kind.is_secret() {
             inner.reverse.insert(ph.0.clone(), original.to_string());
@@ -75,7 +75,7 @@ mod tests {
         let a = v.intern("Falcon", &EntityKind::Custom("project".into()));
         let b = v.intern("Falcon", &EntityKind::Custom("project".into()));
         assert_eq!(a, b);
-        assert_eq!(a.as_str(), "⟦PROJECT_1⟧");
+        assert_eq!(a.as_str(), "__PROJECT_1__");
     }
 
     #[test]
@@ -85,7 +85,7 @@ mod tests {
             "example-secret-value",
             &EntityKind::Secret(SecretClass::ApiKey),
         );
-        assert_eq!(ph.as_str(), "⟦SECRET_1⟧");
+        assert_eq!(ph.as_str(), "__SECRET_1__");
         assert_eq!(v.resolve(ph.as_str()), None); // never reversible
     }
 }

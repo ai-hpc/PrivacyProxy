@@ -48,11 +48,11 @@ fn no_pii_escapes() {
         );
     }
     for ph in [
-        "⟦PERSON_1⟧",
-        "⟦EMAIL_1⟧",
-        "⟦PROJECT_1⟧",
-        "⟦ORG_1⟧",
-        "⟦SECRET_1⟧",
+        "__PERSON_1__",
+        "__EMAIL_1__",
+        "__PROJECT_1__",
+        "__ORG_1__",
+        "__SECRET_1__",
     ] {
         assert!(san.text.contains(ph), "missing {ph} in: {}", san.text);
     }
@@ -70,7 +70,7 @@ fn reversible_round_trips_but_secrets_stay_redacted() {
     }
     // The secret is redact-only: never restored, original never reappears.
     assert!(
-        restored.contains("⟦SECRET_1⟧"),
+        restored.contains("__SECRET_1__"),
         "secret should remain redacted"
     );
     assert!(
