@@ -171,7 +171,7 @@ impl StreamRehydrator {
 mod tests {
     use super::*;
     use pp_core::{EntityKind, Vault};
-    use pp_detect::{EmailRecognizer, EntropyRecognizer, GazetteerRecognizer};
+    use pp_detect::{EmailRecognizer, EntropyRecognizer, GazetteerRecognizer, RegexRecognizer};
     use pp_store::MemVault;
 
     fn floor() -> Ensemble {
@@ -209,6 +209,29 @@ mod tests {
     }
 
     #[test]
+    fn guard_does_not_false_trip_on_our_own_placeholders() {
+        // Anonymise a payload covering every structured-PII kind, then re-run a
+        // regex-inclusive guard (as the gateway does). The resulting placeholders
+        // must NOT themselves match a PII pattern — otherwise every such request
+        // would fail closed.
+        let vault = MemVault::new();
+        let regex_floor = || {
+            Ensemble::new(vec![
+                Box::new(EmailRecognizer) as Box<dyn pp_core::Detector>,
+                Box::new(RegexRecognizer::defaults()),
+            ])
+        };
+        let text = "ssn 123-45-6789 card 4111 1111 1111 1111 ip 203.0.113.7 \
+                    iban GB82WEST12345698765432 ph +1 415-555-0132 mail a@b.com";
+        let san = anonymize(text, &regex_floor(), &vault);
+        assert!(
+            egress_guard(&san.text, &regex_floor()).is_ok(),
+            "guard false-tripped on placeholders: {}",
+            san.text
+        );
+    }
+
+    #[test]
     fn stream_rehydrates_split_placeholder() {
         let vault = MemVault::new();
         let ph = vault.intern("Alex", &EntityKind::Person);
@@ -231,5 +254,69 @@ mod tests {
         assert_eq!(r.push("tail __PER", &vault), "tail ");
         // … and flushed verbatim if it never completes.
         assert_eq!(r.flush(&vault), "__PER");
+    }
+
+    /// Multi-byte text around a matched ASCII term must not panic the byte-offset
+    /// splice, and must round-trip with the surrounding emoji/CJK intact.
+    #[test]
+    fn anonymize_is_utf8_boundary_safe() {
+        let vault = MemVault::new();
+        let text = "🚀 launch Falcon 飞船 for a@b.com 🎯";
+        let san = anonymize(text, &floor(), &vault);
+        assert!(!san.text.contains("Falcon"), "term leaked: {}", san.text);
+        assert!(san.text.contains("🚀") && san.text.contains("飞船") && san.text.contains("🎯"));
+        assert_eq!(rehydrate(&san.text, &vault), text, "round trip lost data");
+    }
+
+    /// Core streaming invariant: for **any** way of cutting a string into
+    /// fragments, feeding them through `push`+`flush` must equal the batch
+    /// `rehydrate` of the whole. Exercises every byte boundary plus the
+    /// degenerate char-by-char stream, over adjacent / unknown / trailing
+    /// placeholders — the cases most likely to corrupt a streamed response.
+    #[test]
+    fn stream_equals_batch_for_every_split() {
+        let vault = MemVault::new();
+        assert_eq!(
+            vault.intern("Alex", &EntityKind::Person).as_str(),
+            "__PERSON_1__"
+        );
+        assert_eq!(
+            vault
+                .intern("Acme", &EntityKind::Custom("org".into()))
+                .as_str(),
+            "__ORG_1__"
+        );
+
+        // Adjacent placeholders, an unknown one (must pass through), a lone "__",
+        // a trailing single "_", and plain text with underscores.
+        let cases = [
+            "a __PERSON_1____ORG_1__ b __NOPE_1__ c",
+            "no placeholders here, just under_scores_",
+            "__PERSON_1__",
+            "edge __ORG_1__ and dangling __",
+            "weird ____ and __PERSON_1__ tail _",
+        ];
+
+        for whole in cases {
+            let expected = rehydrate(whole, &vault);
+
+            // (1) every two-way split at a char boundary.
+            for cut in (0..=whole.len()).filter(|&i| whole.is_char_boundary(i)) {
+                let mut r = StreamRehydrator::new();
+                let mut got = r.push(&whole[..cut], &vault);
+                got.push_str(&r.push(&whole[cut..], &vault));
+                got.push_str(&r.flush(&vault));
+                assert_eq!(got, expected, "split of {whole:?} at {cut}");
+            }
+
+            // (2) the degenerate one-char-at-a-time stream.
+            let mut r = StreamRehydrator::new();
+            let mut got = String::new();
+            for ch in whole.chars() {
+                got.push_str(&r.push(ch.encode_utf8(&mut [0u8; 4]), &vault));
+            }
+            got.push_str(&r.flush(&vault));
+            assert_eq!(got, expected, "char-by-char of {whole:?}");
+        }
     }
 }

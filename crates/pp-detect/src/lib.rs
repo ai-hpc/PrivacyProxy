@@ -582,4 +582,41 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].kind, EntityKind::Custom("codename".into()));
     }
+
+    #[test]
+    fn ensemble_keeps_iban_reversible_over_entropy() {
+        // A 22-char IBAN is long/mixed enough to also trip the entropy detector
+        // (which would redact it irreversibly as a Secret). The regex IBAN
+        // pattern (priority 3) must win so the value round-trips for the client.
+        let ens = Ensemble::new(vec![
+            Box::new(RegexRecognizer::defaults()),
+            Box::new(EntropyRecognizer::default()),
+        ]);
+        let s = "wire to GB82WEST12345698765432 today";
+        let iban = ens
+            .detect(s)
+            .into_iter()
+            .find(|e| &s[e.span.clone()] == "GB82WEST12345698765432")
+            .expect("IBAN not detected");
+        assert_eq!(
+            iban.kind,
+            EntityKind::Iban,
+            "IBAN must be reversible, not a redact-only Secret"
+        );
+    }
+
+    #[test]
+    fn gazetteer_matches_term_amid_multibyte_text() {
+        // Byte offsets from the ASCII-lowercased haystack must map back into the
+        // original multi-byte string, and the word-boundary check must not panic
+        // on a multi-byte neighbour.
+        let g = GazetteerRecognizer::new(vec![(
+            "Falcon".into(),
+            EntityKind::Custom("project".into()),
+        )]);
+        let s = "🚀 ship Falcon 飞船";
+        let found = g.detect(s);
+        assert_eq!(found.len(), 1, "got {found:?}");
+        assert_eq!(&s[found[0].span.clone()], "Falcon");
+    }
 }
