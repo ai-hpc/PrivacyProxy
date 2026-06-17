@@ -11,24 +11,24 @@ use std::env;
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
 use pp_anonymize::egress_guard;
-use pp_core::{Detector, EntityKind, Vault};
+use pp_core::{Detector, EgressPolicy, EntityKind, Memory, Vault};
 use pp_detect::{
     EmailRecognizer, Ensemble, EntropyRecognizer, GazetteerRecognizer, LocalLlmRecognizer,
 };
-use pp_protocol::ChatRequest;
-use pp_store::{LayeredVault, MemVault, SqliteVault};
+use pp_protocol::{ChatRequest, Message};
+use pp_store::{LayeredVault, MemVault, MemoryStore, SqliteVault};
 use pp_upstream::{
     ByteStream, ModelEntry, OpenRouterProvider, Provider, ProviderError, RouterConfig,
 };
@@ -43,6 +43,8 @@ struct AppState {
     provider: Arc<dyn Provider>,
     /// Durable personal vault (SQLite), shared across requests.
     personal: Arc<dyn Vault>,
+    /// Durable, recallable memory store (M2).
+    memory: Arc<MemoryStore>,
     /// Optional semantic detector (local LLM); `None` unless configured.
     llm: Option<Arc<LocalLlmRecognizer>>,
     /// If set, clients must present `Authorization: Bearer <key>`.
@@ -92,6 +94,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     tracing::info!(encrypted = db_key.is_some(), "personal vault: {db}");
 
+    let memory_db =
+        env::var("PRIVACYPROXY_MEMORY_DB").unwrap_or_else(|_| "privacyproxy-memory.db".to_string());
+    let memory: Arc<MemoryStore> = Arc::new(if memory_db == ":memory:" {
+        MemoryStore::in_memory()?
+    } else {
+        MemoryStore::open(&memory_db)?
+    });
+    tracing::info!("memory store: {memory_db}");
+
     let vocab = parse_vocab();
 
     // Optional local semantic detector (e.g. llama.cpp + Falcon-H1-0.5B-Instruct).
@@ -110,6 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vocab,
         provider,
         personal,
+        memory,
         llm,
         local_key,
     });
@@ -124,6 +136,8 @@ fn app(state: SharedState) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/memory", post(memory_add).get(memory_list))
+        .route("/v1/memory/:id", delete(memory_delete))
         .with_state(state)
 }
 
@@ -144,11 +158,37 @@ async fn chat_completions(
         Arc::new(MemVault::new()),
     ));
 
-    // This request's detection floor, optionally augmented by terms the local
-    // semantic detector flags (best-effort; never weakens the floor guarantee).
+    // M2: recall memories relevant to the request and inject the cloud-safe
+    // ones as system context. They flow through anonymize below, so the cloud
+    // only ever sees placeholders; `local_only` memories are never injected.
+    let recalled = state.memory.recall(&gather_text(&req), MEMORY_RECALL_K);
+    let injectable = select_injectable(recalled, MEMORY_BUDGET_TOKENS);
+    if let Some(block) = memory_block(&injectable) {
+        tracing::info!(memories = injectable.len(), "injecting recalled memory");
+        req.messages.insert(
+            0,
+            Message {
+                role: "system".to_string(),
+                content: Some(block),
+                extra: Default::default(),
+            },
+        );
+    }
+
+    // This request's detection floor: user vocabulary + `local_only` memory
+    // terms (so memory strengthens detection on-device), then email, entropy,
+    // and any terms the optional local LLM flags.
+    let mut terms = state.vocab.clone();
+    terms.extend(
+        state
+            .memory
+            .local_only_terms()
+            .into_iter()
+            .map(|t| (t, EntityKind::Custom("private".to_string()))),
+    );
     let mut detectors: Vec<Box<dyn Detector>> = Vec::new();
-    if !state.vocab.is_empty() {
-        detectors.push(Box::new(GazetteerRecognizer::new(state.vocab.clone())));
+    if !terms.is_empty() {
+        detectors.push(Box::new(GazetteerRecognizer::new(terms)));
     }
     detectors.push(Box::new(EmailRecognizer));
     detectors.push(Box::new(EntropyRecognizer::default()));
@@ -344,7 +384,7 @@ fn build_guard(vocab: &[(String, EntityKind)]) -> Ensemble {
     Ensemble::new(detectors)
 }
 
-/// All message text content joined — the input to the optional semantic detector.
+/// All message text content joined — the input to recall and the local detector.
 fn gather_text(req: &ChatRequest) -> String {
     req.messages
         .iter()
@@ -353,9 +393,152 @@ fn gather_text(req: &ChatRequest) -> String {
         .join("\n")
 }
 
+// --- M2 memory ------------------------------------------------------------
+
+const MEMORY_RECALL_K: usize = 8;
+const MEMORY_BUDGET_TOKENS: usize = 400;
+
+/// Keep only memories that may cross the cloud boundary, then select greedily
+/// within a token budget (never dump all memory). `local_only` is dropped.
+fn select_injectable(recalled: Vec<Memory>, budget_tokens: usize) -> Vec<Memory> {
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for m in recalled {
+        if m.egress_policy != EgressPolicy::Anonymized {
+            continue;
+        }
+        let cost = m.content.len() / 4 + 2;
+        if used + cost > budget_tokens {
+            break;
+        }
+        used += cost;
+        out.push(m);
+    }
+    out
+}
+
+/// Format selected memories as a system-context block, or `None` if empty.
+fn memory_block(selected: &[Memory]) -> Option<String> {
+    if selected.is_empty() {
+        return None;
+    }
+    let lines = selected
+        .iter()
+        .map(|m| format!("- {}", m.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "Relevant context about the user (use only if helpful):\n{lines}"
+    ))
+}
+
+fn memory_json(m: &Memory) -> Value {
+    json!({
+        "id": m.id,
+        "content": m.content,
+        "kind": m.kind,
+        "egress_policy": m.egress_policy.as_str(),
+        "created_ms": m.created_ms,
+    })
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+async fn memory_add(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
+    let content = body["content"].as_str().unwrap_or("").trim();
+    if content.is_empty() {
+        return (StatusCode::BAD_REQUEST, "field 'content' is required").into_response();
+    }
+    let kind = body["kind"].as_str().unwrap_or("fact");
+    let policy = EgressPolicy::from_storage(body["egress_policy"].as_str().unwrap_or("anonymized"));
+    match state.memory.add(content, kind, policy, now_ms()) {
+        Some(m) => (StatusCode::CREATED, Json(memory_json(&m))).into_response(),
+        None => (StatusCode::INTERNAL_SERVER_ERROR, "could not store memory").into_response(),
+    }
+}
+
+async fn memory_list(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if !authorized(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
+    let items: Vec<Value> = state.memory.list().iter().map(memory_json).collect();
+    Json(json!({ "memories": items })).into_response()
+}
+
+async fn memory_delete(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
+    if state.memory.delete(&id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mem(content: &str, policy: EgressPolicy) -> Memory {
+        Memory {
+            id: "x".to_string(),
+            content: content.to_string(),
+            kind: "fact".to_string(),
+            egress_policy: policy,
+            created_ms: 0,
+        }
+    }
+
+    #[test]
+    fn injectable_drops_local_only_and_respects_budget() {
+        let recalled = vec![
+            mem("alpha", EgressPolicy::Anonymized),
+            mem("a secret password", EgressPolicy::LocalOnly),
+            mem("beta", EgressPolicy::Anonymized),
+        ];
+        let selected = select_injectable(recalled, 1000);
+        assert_eq!(selected.len(), 2, "local_only must be dropped");
+        assert!(selected
+            .iter()
+            .all(|m| m.egress_policy == EgressPolicy::Anonymized));
+
+        let many: Vec<Memory> = (0..50)
+            .map(|i| {
+                mem(
+                    &format!("memory number {i} with some padding text"),
+                    EgressPolicy::Anonymized,
+                )
+            })
+            .collect();
+        assert!(
+            select_injectable(many, 40).len() < 50,
+            "budget must truncate"
+        );
+    }
+
+    #[test]
+    fn memory_block_formats_or_none() {
+        assert!(memory_block(&[]).is_none());
+        let block = memory_block(&[mem("likes jazz", EgressPolicy::Anonymized)]).unwrap();
+        assert!(block.contains("- likes jazz"));
+    }
 
     #[test]
     fn vocab_from_env_and_file() {

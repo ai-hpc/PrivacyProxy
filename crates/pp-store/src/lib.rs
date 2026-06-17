@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit};
-use pp_core::{EntityKind, Placeholder, Vault};
+use pp_core::{EgressPolicy, EntityKind, Memory, Placeholder, Vault};
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 
@@ -330,10 +330,222 @@ impl Vault for LayeredVault {
     }
 }
 
+// ---------------------------------------------------------------------------
+// MemoryStore (M2) — durable, recallable memories with FTS5 keyword search
+// (`doc/MEMORY.md`). Content is stored in plaintext because full-text search
+// needs it; the file is local-only and git-ignored. (At-rest encryption of a
+// *searchable* store is a separate, harder problem and is deferred.)
+// ---------------------------------------------------------------------------
+
+/// SQLite + FTS5 backed store of recallable memories.
+pub struct MemoryStore {
+    conn: Mutex<Connection>,
+}
+
+fn init_memory_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memories (
+            id            TEXT PRIMARY KEY,
+            content       TEXT NOT NULL,
+            kind          TEXT NOT NULL,
+            egress_policy TEXT NOT NULL,
+            created_ms    INTEGER NOT NULL
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id UNINDEXED, content);",
+    )
+}
+
+impl MemoryStore {
+    pub fn open(path: &str) -> rusqlite::Result<Self> {
+        let conn = Connection::open(path)?;
+        init_memory_schema(&conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    pub fn in_memory() -> rusqlite::Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        init_memory_schema(&conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Store a memory, returning it with a generated id (`None` on error).
+    pub fn add(
+        &self,
+        content: &str,
+        kind: &str,
+        egress_policy: EgressPolicy,
+        created_ms: i64,
+    ) -> Option<Memory> {
+        let mut id_bytes = [0u8; 8];
+        getrandom::getrandom(&mut id_bytes).ok()?;
+        let id: String = id_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute(
+            "INSERT INTO memories (id, content, kind, egress_policy, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, content, kind, egress_policy.as_str(), created_ms],
+        )
+        .ok()?;
+        conn.execute(
+            "INSERT INTO memories_fts (id, content) VALUES (?1, ?2)",
+            params![id, content],
+        )
+        .ok()?;
+        Some(Memory {
+            id,
+            content: content.to_string(),
+            kind: kind.to_string(),
+            egress_policy,
+            created_ms,
+        })
+    }
+
+    pub fn delete(&self, id: &str) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = conn.execute("DELETE FROM memories_fts WHERE id = ?1", params![id]);
+        conn.execute("DELETE FROM memories WHERE id = ?1", params![id])
+            .map(|n| n > 0)
+            .unwrap_or(false)
+    }
+
+    pub fn list(&self) -> Vec<Memory> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, content, kind, egress_policy, created_ms
+             FROM memories ORDER BY created_ms DESC",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map([], row_to_memory)
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+            .unwrap_or_default()
+    }
+
+    /// Keyword recall (FTS5 / BM25). Returns all matching memories regardless of
+    /// `egress_policy`; the caller decides what may be injected.
+    pub fn recall(&self, text: &str, limit: usize) -> Vec<Memory> {
+        let query = fts_query(text);
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT m.id, m.content, m.kind, m.egress_policy, m.created_ms
+             FROM memories_fts f JOIN memories m ON m.id = f.id
+             WHERE memories_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map(params![query, limit as i64], row_to_memory)
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+            .unwrap_or_default()
+    }
+
+    /// Contents of all `local_only` memories — used on-device to seed the
+    /// gazetteer. Never sent anywhere.
+    pub fn local_only_terms(&self) -> Vec<String> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let Ok(mut stmt) =
+            conn.prepare("SELECT content FROM memories WHERE egress_policy = 'local_only'")
+        else {
+            return Vec::new();
+        };
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+            .unwrap_or_default()
+    }
+}
+
+fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
+    Ok(Memory {
+        id: row.get(0)?,
+        content: row.get(1)?,
+        kind: row.get(2)?,
+        egress_policy: EgressPolicy::from_storage(&row.get::<_, String>(3)?),
+        created_ms: row.get(4)?,
+    })
+}
+
+/// Build a safe FTS5 query from arbitrary text: unique alphanumeric tokens
+/// (len >= 3), each quoted, OR-joined, capped. Empty if no usable tokens.
+fn fts_query(text: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut terms: Vec<String> = Vec::new();
+    for word in text.split(|c: char| !c.is_alphanumeric()) {
+        if word.len() < 3 {
+            continue;
+        }
+        let lower = word.to_ascii_lowercase();
+        if seen.insert(lower.clone()) {
+            terms.push(format!("\"{lower}\""));
+            if terms.len() >= 32 {
+                break;
+            }
+        }
+    }
+    terms.join(" OR ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pp_core::SecretClass;
+
+    #[test]
+    fn memory_add_recall_list_delete() {
+        let m = MemoryStore::in_memory().expect("mem");
+        m.add(
+            "User prefers dark roast coffee",
+            "preference",
+            EgressPolicy::Anonymized,
+            1,
+        )
+        .expect("add");
+        m.add(
+            "Project Falcon is the user's startup",
+            "fact",
+            EgressPolicy::LocalOnly,
+            2,
+        )
+        .expect("add");
+
+        let hits = m.recall("what coffee do I like", 8);
+        assert!(
+            hits.iter().any(|x| x.content.contains("dark roast")),
+            "expected coffee recall, got {hits:?}"
+        );
+
+        assert_eq!(
+            m.local_only_terms(),
+            vec!["Project Falcon is the user's startup".to_string()]
+        );
+
+        assert_eq!(m.list().len(), 2);
+        let id = m.list()[0].id.clone();
+        assert!(m.delete(&id));
+        assert_eq!(m.list().len(), 1);
+    }
+
+    #[test]
+    fn memory_recall_is_safe_on_punctuation_and_misses() {
+        let m = MemoryStore::in_memory().expect("mem");
+        m.add(
+            "The user's startup is called Falcon",
+            "fact",
+            EgressPolicy::Anonymized,
+            1,
+        )
+        .expect("add");
+        assert!(m
+            .recall("tell me about Falcon & its roadmap!?", 8)
+            .iter()
+            .any(|x| x.content.contains("Falcon")));
+        assert!(m.recall("zzz", 8).is_empty()); // no usable tokens / no match
+    }
 
     #[test]
     fn mem_deterministic_per_original() {

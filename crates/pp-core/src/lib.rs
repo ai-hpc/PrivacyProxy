@@ -110,3 +110,46 @@ pub trait Vault: Send + Sync {
     fn intern(&self, original: &str, kind: &EntityKind) -> Placeholder;
     fn resolve(&self, placeholder: &str) -> Option<String>;
 }
+
+// ---------------------------------------------------------------------------
+// Memory (M2) — see `doc/MEMORY.md`.
+// ---------------------------------------------------------------------------
+
+/// Whether a stored memory may cross the cloud boundary, and how. This is the
+/// privacy-gateway adaptation of genie-claw's `spoken_policy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EgressPolicy {
+    /// Never injected into a cloud request; usable only on-device (e.g. to seed
+    /// the gazetteer or local tools).
+    LocalOnly,
+    /// May be injected, but only via the anonymize pipeline — the cloud sees
+    /// placeholders. The default.
+    Anonymized,
+}
+
+impl EgressPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalOnly => "local_only",
+            Self::Anonymized => "anonymized",
+        }
+    }
+
+    /// Parse from stored/user text; defaults to the safe `Anonymized`.
+    pub fn from_storage(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "local_only" | "local-only" | "local" => Self::LocalOnly,
+            _ => Self::Anonymized,
+        }
+    }
+}
+
+/// A stored memory: a durable fact/preference/context the gateway can recall.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Memory {
+    pub id: String,
+    pub content: String,
+    pub kind: String,
+    pub egress_policy: EgressPolicy,
+    pub created_ms: i64,
+}
