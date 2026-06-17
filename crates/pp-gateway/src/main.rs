@@ -1,7 +1,7 @@
 //! `pp-gateway` — the `privacyproxy` binary: an OpenAI-compatible HTTP gateway
-//! that anonymises requests, routes to OpenRouter's free models with failover,
-//! and rehydrates responses — buffered and streaming (`ARCHITECTURE.md` §5,
-//! §10, §12).
+//! that anonymises requests (content, tool-call args, tool descriptions),
+//! routes to OpenRouter's free models with failover, and rehydrates responses —
+//! buffered and streaming (`ARCHITECTURE.md` §4, §5, §7, §10, §12).
 #![forbid(unsafe_code)]
 
 mod pipeline;
@@ -22,7 +22,7 @@ use axum::{
 };
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
-use pp_anonymize::{egress_guard, StreamRehydrator};
+use pp_anonymize::egress_guard;
 use pp_core::{Detector, EntityKind, Vault};
 use pp_detect::{EmailRecognizer, Ensemble, EntropyRecognizer, GazetteerRecognizer};
 use pp_protocol::ChatRequest;
@@ -129,7 +129,7 @@ async fn chat_completions(
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({ "error": {
                 "message": "request blocked: detected un-anonymised sensitive data in a \
-                            field the gateway does not yet rewrite (e.g. tool definitions)",
+                            field the gateway does not rewrite (e.g. a function name)",
                 "type": "privacy_egress_guard"
             }})),
         )
@@ -160,14 +160,14 @@ async fn chat_completions(
 }
 
 /// Transform the upstream SSE byte stream into a rehydrated SSE response: parse
-/// each `data:` frame, restore placeholders in `delta.content` (reassembling
-/// any split across frames via [`StreamRehydrator`]), and re-emit.
+/// each `data:` frame, restore placeholders in `delta.content` and tool-call
+/// arguments (reassembling any split across frames), and re-emit.
 fn sse_rehydrated(
     upstream: ByteStream,
     vault: Arc<dyn Vault>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = async_stream::stream! {
-        let mut rehydrators: Vec<StreamRehydrator> = Vec::new();
+        let mut state = pipeline::StreamState::default();
         let mut events = upstream.eventsource();
         while let Some(item) = events.next().await {
             let event = match item {
@@ -175,29 +175,23 @@ fn sse_rehydrated(
                 Err(_) => break, // upstream stream error → end the response
             };
             if event.data == "[DONE]" {
-                for r in rehydrators.iter_mut() {
-                    let tail = r.flush(&*vault);
-                    if !tail.is_empty() {
-                        yield ev(tail_chunk(&tail));
-                    }
+                for chunk in state.flush(&*vault) {
+                    yield ev(chunk.to_string());
                 }
                 yield ev("[DONE]".to_string());
                 return;
             }
             match serde_json::from_str::<Value>(&event.data) {
                 Ok(mut chunk) => {
-                    pipeline::rehydrate_deltas(&mut chunk, &mut rehydrators, &*vault);
+                    pipeline::rehydrate_deltas(&mut chunk, &mut state, &*vault);
                     yield ev(chunk.to_string());
                 }
                 Err(_) => yield ev(event.data),
             }
         }
         // Upstream ended without an explicit [DONE]: flush any held tails.
-        for r in rehydrators.iter_mut() {
-            let tail = r.flush(&*vault);
-            if !tail.is_empty() {
-                yield ev(tail_chunk(&tail));
-            }
+        for chunk in state.flush(&*vault) {
+            yield ev(chunk.to_string());
         }
     };
     Sse::new(stream)
@@ -205,10 +199,6 @@ fn sse_rehydrated(
 
 fn ev(data: String) -> Result<Event, Infallible> {
     Ok(Event::default().data(data))
-}
-
-fn tail_chunk(content: &str) -> String {
-    json!({ "choices": [{ "index": 0, "delta": { "content": content } }] }).to_string()
 }
 
 fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
