@@ -24,7 +24,7 @@ Early but working. The M1 core is functional and **validated live** against Open
 | Capability-aware failover across free models | ✅ |
 | Fail-closed egress guard | ✅ |
 
-Not yet: local NER/LLM detection, a persistent SQLite vault (currently in-memory per request), multimodal content. See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full design and roadmap.
+Not yet: local NER/LLM detection, multimodal content. See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full design and roadmap.
 
 ## How it works
 
@@ -89,12 +89,13 @@ Reversible entities round-trip (placeholder out, real value back); secrets are r
 | `PRIVACYPROXY_VOCAB` | comma-separated private terms | empty |
 | `PRIVACYPROXY_LOCAL_KEY` | require `Authorization: Bearer <key>` from clients | unset → auth disabled (dev) |
 | `PRIVACYPROXY_BIND` | listen address | `127.0.0.1:8080` |
+| `PRIVACYPROXY_DB` | durable vault path (`:memory:` for ephemeral) | `privacyproxy.db` |
 
 ## Limitations (honest)
 
 - **Structural tool fields** (function names, parameter keys) aren't anonymized — they can't carry the placeholder sentinel. If one contains PII, the egress guard **blocks** the request (fail-closed) rather than leak it.
 - **Detection is the deterministic floor only** — no semantic NER yet, so PII outside your vocabulary / emails / secrets isn't caught.
-- **The vault is in-memory per request** — consistent within a request (including multi-turn agent history), but not persisted across restarts.
+- **Two-layer vault** — known vocabulary persists durably (SQLite); emails/secrets/discovered entities are ephemeral per request. Originals are stored as plaintext in the local DB (git-ignored); encryption at rest is a follow-up.
 - **Output quality** ≈ free-model ceiling × context surviving anonymization. Coding and agent work fit best, since logic and structure survive masking.
 
 ## Project layout
@@ -104,7 +105,7 @@ crates/
   pp-core        domain types + Detector/Vault traits (no I/O)
   pp-detect      detection floor: gazetteer · email · entropy + reconciliation
   pp-anonymize   anonymize · rehydrate · streaming StreamRehydrator · egress guard
-  pp-store       in-memory deterministic vault (SQLite vault: planned)
+  pp-store       vaults: in-memory · SQLite · two-layer (durable + ephemeral)
   pp-upstream    Provider + OpenRouter client with capability-aware failover
   pp-protocol    OpenAI-compatible wire types
   pp-gateway     the `privacyproxy` binary: axum server + pipeline
