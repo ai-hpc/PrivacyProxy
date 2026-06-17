@@ -25,7 +25,7 @@ Early but working. The M1 core is functional and **validated live** against Open
 | Fail-closed egress guard | ✅ |
 | Optional on-device semantic detection (local LLM) | ✅ (opt-in) |
 
-Not yet: dedicated ONNX in-process NER, multimodal content. See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full design and roadmap.
+Not yet: dedicated ONNX in-process NER, multimodal content. See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full design and roadmap. The **M2 local-memory** design (adapted from [genie-claw](https://github.com/GeniePod/genie-claw)) is in **[doc/MEMORY.md](doc/MEMORY.md)**.
 
 ## How it works
 
