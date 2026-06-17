@@ -24,8 +24,9 @@ Early but working. The M1 core is functional and **validated live** against Open
 | Capability-aware failover across free models | ✅ |
 | Fail-closed egress guard | ✅ |
 | Optional on-device semantic detection (local LLM) | ✅ (opt-in) |
+| Local memory (M2): recall · policy-filtered injection · audit export | ✅ |
 
-Not yet: dedicated ONNX in-process NER, multimodal content. See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full design and roadmap. The **M2 local-memory** design (adapted from [genie-claw](https://github.com/GeniePod/genie-claw)) is in **[doc/MEMORY.md](doc/MEMORY.md)**.
+Not yet: dedicated ONNX in-process NER, multimodal content, conversational memory extraction. See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full design. The **M2 local-memory** system (adapted from [genie-claw](https://github.com/GeniePod/genie-claw)) is designed and implemented per **[doc/MEMORY.md](doc/MEMORY.md)**.
 
 ## How it works
 
@@ -90,6 +91,22 @@ llama-server -m falcon-h1-0.5b-instruct.gguf --port 8081
 export PRIVACYPROXY_LLM_URL=http://127.0.0.1:8081
 ```
 
+## Memory (M2)
+
+The gateway can remember facts/preferences and recall the relevant ones into a request — **anonymized in-band**, so the cloud only ever sees placeholders.
+
+```bash
+# remember something
+#   anonymized (default) = may be injected, but masked by the pipeline
+#   local_only           = never sent to the cloud
+curl -s localhost:8080/v1/memory -H content-type:application/json \
+  -d '{"content":"User prefers concise answers","kind":"preference"}'
+
+curl -s localhost:8080/v1/memory/export   # human-auditable Markdown of what's stored
+```
+
+`local_only` memories are never injected into a cloud request; instead they **seed the gazetteer**, so their terms are masked everywhere. Recalled memories are tracked and promoted with use. Design + provenance (adapted from genie-claw): **[doc/MEMORY.md](doc/MEMORY.md)**.
+
 ## Configuration
 
 | Env var | Purpose | Default |
@@ -103,6 +120,8 @@ export PRIVACYPROXY_LLM_URL=http://127.0.0.1:8081
 | `PRIVACYPROXY_LLM_MODEL` | model name for the semantic detector | `falcon-h1-0.5b-instruct` |
 | `PRIVACYPROXY_DB_KEY` | passphrase to encrypt the durable vault at rest (AES-256-GCM) | unset (plaintext) |
 | `PRIVACYPROXY_VOCAB_FILE` | file of vocabulary terms, one per line (`#` comments) | unset |
+| `PRIVACYPROXY_MEMORY_DB` | memory store path (`:memory:` for ephemeral) | `privacyproxy-memory.db` |
+| `PRIVACYPROXY_MEMORY_SEMANTIC` | `1` enables semantic recall (hash embedder) | off |
 
 ## Limitations (honest)
 

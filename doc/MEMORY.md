@@ -1,6 +1,6 @@
 # PrivacyProxy — Memory System Design (M2)
 
-> **Status:** design doc for **M2**. The M1 privacy core (detection · vault · gateway · streaming · tools) is built; this proposes local memory on top of it.
+> **Status:** **M2 Phases 1–3 implemented** — recall + policy-filtered anonymized injection · opt-in semantic recall · recall-tracking/promotion/auditable export. Conversational *extraction* and time-decay ranking are deferred. This doc is the design; the code lives in `pp-store` (`MemoryStore`, `HashEmbedder`) and `pp-gateway` (`/v1/memory*`).
 > **Render note:** Mermaid diagrams — view on GitHub / a Mermaid-capable viewer.
 
 ## Provenance
@@ -136,9 +136,9 @@ Table-driven recall cases: each seeds memories, runs a query, and asserts hit/mi
 
 ## Rollout phases (mirroring genie-claw's Phase 0/1/2)
 
-1. **Phase 1 — FTS + policy + anonymized injection.** New `pp-memory` crate: SQLite `memories` + FTS5 + policy metadata; `/v1/memory` CRUD; per-query, token-budgeted, policy-filtered injection through the M1 pipeline; `local_only` seeds the gazetteer. Table-driven + leak tests. *(No embeddings, no behavior on the critical path unless memory is configured.)*
-2. **Phase 2 — semantic provider.** Add `Embedder`/`SemanticIndex`; an optional local embedder; hybrid FTS+semantic fusion. Off by default.
-3. **Phase 3 — lifecycle.** Recall tracking, decay, promotion, and auditable markdown artifacts (`memory/YYYY-MM-DD.md`, a promoted `MEMORY.md`), plus opt-in extraction.
+1. ✅ **Phase 1 — FTS + policy + anonymized injection.** `MemoryStore` in `pp-store` (SQLite `memories` + FTS5; reuses the existing crate rather than a new one); `/v1/memory` CRUD; per-query, token-budgeted, policy-filtered injection through the M1 pipeline; `local_only` seeds the gazetteer. *(No behaviour on the critical path unless memory is configured.)*
+2. ✅ **Phase 2 — semantic provider.** `Embedder` trait + a default `HashEmbedder`; SQLite-stored vectors; brute-force cosine `semantic_recall`; hybrid FTS+semantic fusion. Off by default (`PRIVACYPROXY_MEMORY_SEMANTIC=1`).
+3. ✅ **Phase 3 — lifecycle.** Recall tracking, threshold promotion, and an auditable Markdown export (`GET /v1/memory/export`). **Deferred:** conversational extraction (heuristic-fragile; better via the optional local LLM) and time-decay ranking.
 
 ## Non-goals
 
