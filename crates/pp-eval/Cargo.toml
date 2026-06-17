@@ -1,0 +1,21 @@
+[package]
+name = "pp-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pp-eval"
+path = "src/main.rs"
+
+[dependencies]
+pp-core = { path = "../pp-core" }
+pp-detect = { path = "../pp-detect" }
+pp-anonymize = { path = "../pp-anonymize" }
+pp-store = { path = "../pp-store" }
+pp-upstream = { path = "../pp-upstream" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde_json = "1"
+async-trait = "0.1"
