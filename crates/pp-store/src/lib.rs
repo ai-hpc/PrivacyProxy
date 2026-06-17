@@ -420,26 +420,31 @@ impl MemoryStore {
         let mut id_bytes = [0u8; 8];
         getrandom::getrandom(&mut id_bytes).ok()?;
         let id: String = id_bytes.iter().map(|b| format!("{b:02x}")).collect();
-        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        conn.execute(
+        // Embed outside the lock. The base row + FTS row go in one transaction so
+        // a mid-write failure can't leave a memory that's listed but unrecallable;
+        // the embedding stays best-effort (semantic recall is optional).
+        let embedding = self.embedder.as_ref().map(|e| e.embed(content));
+        let mut conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = conn.transaction().ok()?;
+        tx.execute(
             "INSERT INTO memories
              (id, content, kind, egress_policy, created_ms, recall_count, accessed_ms, promoted)
              VALUES (?1, ?2, ?3, ?4, ?5, 0, ?5, 0)",
             params![id, content, kind, egress_policy.as_str(), created_ms],
         )
         .ok()?;
-        conn.execute(
+        tx.execute(
             "INSERT INTO memories_fts (id, content) VALUES (?1, ?2)",
             params![id, content],
         )
         .ok()?;
-        if let Some(embedder) = &self.embedder {
-            let vector = embedder.embed(content);
-            let _ = conn.execute(
+        if let Some(vector) = &embedding {
+            let _ = tx.execute(
                 "INSERT INTO embeddings (memory_id, dim, vector) VALUES (?1, ?2, ?3)",
-                params![id, vector.len() as i64, encode_vec(&vector)],
+                params![id, vector.len() as i64, encode_vec(vector)],
             );
         }
+        tx.commit().ok()?;
         Some(Memory {
             id,
             content: content.to_string(),
