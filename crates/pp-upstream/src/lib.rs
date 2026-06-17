@@ -143,10 +143,15 @@ impl Provider for OpenRouterProvider {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
-                        return resp
-                            .json::<Value>()
-                            .await
-                            .map_err(|e| ProviderError::Decode(e.to_string()));
+                        match resp.json::<Value>().await {
+                            Ok(value) => return Ok(value),
+                            // Body read failed (e.g. a slow model hit the read
+                            // timeout) — fail over to the next model.
+                            Err(e) => {
+                                last = Some(ProviderError::Decode(e.to_string()));
+                                continue;
+                            }
+                        }
                     }
                     let code = status.as_u16();
                     if code == 429 || status.is_server_error() {
