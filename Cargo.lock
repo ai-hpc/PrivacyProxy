@@ -731,6 +731,8 @@ name = "pp-detect"
 version = "0.1.0"
 dependencies = [
  "pp-core",
+ "reqwest",
+ "serde_json",
 ]
 
 [[package]]

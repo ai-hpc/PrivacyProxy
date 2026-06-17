@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 use pp_core::{Detector, DetectorId, Entity, EntityKind, SecretClass};
+use serde_json::{json, Value};
 
 /// Runs every detector and reconciles overlapping spans into a clean,
 /// non-overlapping, left-to-right sequence.
@@ -68,11 +69,20 @@ fn reconcile(mut scored: Vec<(u8, Entity)>) -> Vec<Entity> {
 /// Matches user private-vocabulary terms.
 pub struct GazetteerRecognizer {
     terms: Vec<(String, EntityKind)>,
+    priority: u8,
 }
 
 impl GazetteerRecognizer {
+    /// A deterministic-floor gazetteer (priority 3).
     pub fn new(terms: Vec<(String, EntityKind)>) -> Self {
-        Self { terms }
+        Self { terms, priority: 3 }
+    }
+
+    /// A gazetteer with an explicit priority — e.g. priority 2 for terms
+    /// discovered by the (statistical) local LLM, so they lose to the floor
+    /// but still beat entropy on a span conflict.
+    pub fn with_priority(terms: Vec<(String, EntityKind)>, priority: u8) -> Self {
+        Self { terms, priority }
     }
 }
 
@@ -81,7 +91,7 @@ impl Detector for GazetteerRecognizer {
         DetectorId("gazetteer")
     }
     fn priority(&self) -> u8 {
-        3
+        self.priority
     }
     fn detect(&self, text: &str) -> Vec<Entity> {
         // ASCII-lowercasing preserves byte length, so offsets map back 1:1.
@@ -256,9 +266,176 @@ fn shannon_entropy(s: &str) -> f64 {
     h
 }
 
+// ---------------------------------------------------------------------------
+// LocalLlmRecognizer — OPTIONAL semantic detector via a local OpenAI-compatible
+// LLM (e.g. llama.cpp serving Falcon-H1-0.5B-Instruct). Best-effort recall
+// beyond the deterministic floor; on ANY error it returns nothing, so the
+// floor's guarantee is never weakened. It is NOT part of that guarantee.
+// ---------------------------------------------------------------------------
+
+const LLM_SYSTEM_PROMPT: &str = "You detect personal or confidential identifiers in the \
+user's text: people, organizations, locations, project/product code-names, and similar \
+sensitive names. Reply with ONLY a JSON object of the form \
+{\"entities\":[{\"text\":\"...\",\"type\":\"person|org|location|project|other\"}]}. \
+Copy each text span EXACTLY as written. If there are none, reply {\"entities\":[]}.";
+
+/// Calls a local OpenAI-compatible chat endpoint to extract sensitive spans.
+pub struct LocalLlmRecognizer {
+    http: reqwest::Client,
+    endpoint: String,
+    model: String,
+}
+
+impl LocalLlmRecognizer {
+    /// `base_url` is the server root, e.g. `http://127.0.0.1:8081`.
+    pub fn new(base_url: &str, model: &str) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            http,
+            endpoint: format!("{}/v1/chat/completions", base_url.trim_end_matches('/')),
+            model: model.to_string(),
+        }
+    }
+
+    /// Extract `(snippet, kind)` pairs. Returns empty on any error — the
+    /// deterministic floor still protects the request.
+    pub async fn scan(&self, text: &str) -> Vec<(String, EntityKind)> {
+        if text.trim().is_empty() {
+            return Vec::new();
+        }
+        let body = json!({
+            "model": self.model,
+            "temperature": 0,
+            "messages": [
+                { "role": "system", "content": LLM_SYSTEM_PROMPT },
+                { "role": "user", "content": text },
+            ],
+        });
+        let Ok(resp) = self.http.post(&self.endpoint).json(&body).send().await else {
+            return Vec::new();
+        };
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(value) = resp.json::<Value>().await else {
+            return Vec::new();
+        };
+        let content = value["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default();
+        parse_entities(content)
+    }
+}
+
+/// Map the model's free-form type label onto an [`EntityKind`].
+fn map_kind(label: &str) -> EntityKind {
+    match label.to_ascii_lowercase().as_str() {
+        "person" | "name" | "people" => EntityKind::Person,
+        "org" | "organization" | "organisation" | "company" => EntityKind::Org,
+        "location" | "loc" | "place" | "address" | "gpe" => EntityKind::Location,
+        _ => EntityKind::Custom("private".to_string()),
+    }
+}
+
+/// Parse the model's reply into `(snippet, kind)` pairs. Robust to surrounding
+/// prose/markdown and malformed output (returns what it can, else empty).
+fn parse_entities(content: &str) -> Vec<(String, EntityKind)> {
+    let Some(json_str) = extract_json_object(content) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(json_str) else {
+        return Vec::new();
+    };
+    let Some(items) = value.get("entities").and_then(|e| e.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let text = item
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if text.is_empty() {
+            continue;
+        }
+        let label = item.get("type").and_then(Value::as_str).unwrap_or("");
+        out.push((text.to_string(), map_kind(label)));
+    }
+    out
+}
+
+/// Extract the first balanced `{...}` object from arbitrary text (models often
+/// wrap JSON in prose or markdown fences). Brace-aware of string literals.
+fn extract_json_object(s: &str) -> Option<&str> {
+    let start = s.find('{')?;
+    let bytes = s.as_bytes();
+    let (mut depth, mut in_str, mut escaped) = (0i32, false, false);
+    for (i, &c) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&s[start..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llm_parse_clean_json() {
+        let r = parse_entities(
+            r#"{"entities":[{"text":"Alex","type":"person"},{"text":"Acme","type":"org"}]}"#,
+        );
+        assert_eq!(
+            r,
+            vec![
+                ("Alex".to_string(), EntityKind::Person),
+                ("Acme".to_string(), EntityKind::Org),
+            ]
+        );
+    }
+
+    #[test]
+    fn llm_parse_json_wrapped_in_prose() {
+        let reply = "Sure! Here you go:\n```json\n{\"entities\":[{\"text\":\"Falcon\",\"type\":\"project\"}]}\n```\nLet me know if you need more.";
+        assert_eq!(
+            parse_entities(reply),
+            vec![(
+                "Falcon".to_string(),
+                EntityKind::Custom("private".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn llm_parse_garbage_is_empty() {
+        assert!(parse_entities("I did not find any sensitive entities.").is_empty());
+        assert!(parse_entities("").is_empty());
+        assert!(parse_entities("{not valid json").is_empty());
+    }
 
     #[test]
     fn email_detected() {

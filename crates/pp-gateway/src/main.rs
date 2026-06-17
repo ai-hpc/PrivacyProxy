@@ -24,7 +24,9 @@ use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
 use pp_anonymize::egress_guard;
 use pp_core::{Detector, EntityKind, Vault};
-use pp_detect::{EmailRecognizer, Ensemble, EntropyRecognizer, GazetteerRecognizer};
+use pp_detect::{
+    EmailRecognizer, Ensemble, EntropyRecognizer, GazetteerRecognizer, LocalLlmRecognizer,
+};
 use pp_protocol::ChatRequest;
 use pp_store::{LayeredVault, MemVault, SqliteVault};
 use pp_upstream::{
@@ -34,13 +36,15 @@ use serde_json::{json, Value};
 
 /// Shared, immutable application state.
 struct AppState {
-    /// Full detection floor (incl. entropy) used to anonymise message content.
-    anonymizer: Ensemble,
+    /// User private vocabulary (parsed once); the gazetteer is built per request.
+    vocab: Vec<(String, EntityKind)>,
     /// Precise re-detection (no entropy) for the egress guard.
     guard: Ensemble,
     provider: Arc<dyn Provider>,
     /// Durable personal vault (SQLite), shared across requests.
     personal: Arc<dyn Vault>,
+    /// Optional semantic detector (local LLM); `None` unless configured.
+    llm: Option<Arc<LocalLlmRecognizer>>,
     /// If set, clients must present `Authorization: Bearer <key>`.
     local_key: Option<String>,
 }
@@ -85,11 +89,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     tracing::info!("personal vault: {db}");
 
+    let vocab = parse_vocab();
+
+    // Optional local semantic detector (e.g. llama.cpp + Falcon-H1-0.5B-Instruct).
+    let llm = env::var("PRIVACYPROXY_LLM_URL")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .map(|url| {
+            let model = env::var("PRIVACYPROXY_LLM_MODEL")
+                .unwrap_or_else(|_| "falcon-h1-0.5b-instruct".to_string());
+            tracing::info!("local semantic detection: {url} ({model})");
+            Arc::new(LocalLlmRecognizer::new(&url, &model))
+        });
+
     let state = Arc::new(AppState {
-        anonymizer: build_ensemble(true),
-        guard: build_ensemble(false),
+        guard: build_guard(&vocab),
+        vocab,
         provider,
         personal,
+        llm,
         local_key,
     });
 
@@ -122,7 +140,25 @@ async fn chat_completions(
         state.personal.clone(),
         Arc::new(MemVault::new()),
     ));
-    let audit = pipeline::anonymize_request(&mut req, &state.anonymizer, &*vault);
+
+    // This request's detection floor, optionally augmented by terms the local
+    // semantic detector flags (best-effort; never weakens the floor guarantee).
+    let mut detectors: Vec<Box<dyn Detector>> = Vec::new();
+    if !state.vocab.is_empty() {
+        detectors.push(Box::new(GazetteerRecognizer::new(state.vocab.clone())));
+    }
+    detectors.push(Box::new(EmailRecognizer));
+    detectors.push(Box::new(EntropyRecognizer::default()));
+    if let Some(llm) = &state.llm {
+        let found = llm.scan(&gather_text(&req)).await;
+        if !found.is_empty() {
+            tracing::info!(semantic = found.len(), "local LLM flagged extra entities");
+            detectors.push(Box::new(GazetteerRecognizer::with_priority(found, 2)));
+        }
+    }
+    let anonymizer = Ensemble::new(detectors);
+
+    let audit = pipeline::anonymize_request(&mut req, &anonymizer, &*vault);
     let needs_tools = req.has_tools();
     let streaming = req.stream == Some(true);
 
@@ -268,26 +304,34 @@ fn default_models() -> RouterConfig {
     }
 }
 
-/// Build a detection ensemble. `with_entropy` distinguishes the anonymiser
-/// (full floor) from the egress guard (precise, no entropy). Optional user
-/// vocabulary comes from `PRIVACYPROXY_VOCAB` (comma-separated terms).
-fn build_ensemble(with_entropy: bool) -> Ensemble {
-    let mut detectors: Vec<Box<dyn Detector>> = Vec::new();
-
-    let terms: Vec<(String, EntityKind)> = env::var("PRIVACYPROXY_VOCAB")
+/// Parse the user's private vocabulary from `PRIVACYPROXY_VOCAB` (comma-separated).
+fn parse_vocab() -> Vec<(String, EntityKind)> {
+    env::var("PRIVACYPROXY_VOCAB")
         .unwrap_or_default()
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| (s.to_string(), EntityKind::Custom("private".to_string())))
-        .collect();
-    if !terms.is_empty() {
-        detectors.push(Box::new(GazetteerRecognizer::new(terms)));
-    }
+        .collect()
+}
 
-    detectors.push(Box::new(EmailRecognizer));
-    if with_entropy {
-        detectors.push(Box::new(EntropyRecognizer::default()));
+/// Egress-guard ensemble: precise deterministic identifiers only (vocabulary +
+/// email — no entropy, no LLM terms). The guard enforces the guarantee, and the
+/// guarantee is the deterministic floor.
+fn build_guard(vocab: &[(String, EntityKind)]) -> Ensemble {
+    let mut detectors: Vec<Box<dyn Detector>> = Vec::new();
+    if !vocab.is_empty() {
+        detectors.push(Box::new(GazetteerRecognizer::new(vocab.to_vec())));
     }
+    detectors.push(Box::new(EmailRecognizer));
     Ensemble::new(detectors)
+}
+
+/// All message text content joined — the input to the optional semantic detector.
+fn gather_text(req: &ChatRequest) -> String {
+    req.messages
+        .iter()
+        .filter_map(|m| m.content.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
