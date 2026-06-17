@@ -287,10 +287,25 @@ impl RegexRecognizer {
         Self { patterns }
     }
 
-    /// Built-in structured-PII patterns: US SSN and NANP-style phone numbers.
+    /// Built-in structured-PII patterns: SSN, credit cards, IPv4, IBAN, phone.
+    /// Phone is listed last so that on a numeric tie (e.g. a 16-digit string)
+    /// the more specific card/IP match wins by insertion order in reconcile.
     pub fn defaults() -> Self {
         Self::new(vec![
             (r"\b\d{3}-\d{2}-\d{4}\b", EntityKind::Ssn),
+            (
+                r"\b\d{4}[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}\b",
+                EntityKind::CreditCard,
+            ),
+            (
+                r"\b3[47]\d{2}[ -]?\d{6}[ -]?\d{5}\b",
+                EntityKind::CreditCard,
+            ),
+            (
+                r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b",
+                EntityKind::IpAddress,
+            ),
+            (r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b", EntityKind::Iban),
             (r"\+?\d{1,4}(?:[ .\-]\d{3,4}){2,4}", EntityKind::Phone),
         ])
     }
@@ -523,6 +538,33 @@ mod tests {
             found.iter().any(|e| e.kind == EntityKind::Phone),
             "phone not detected: {found:?}"
         );
+    }
+
+    #[test]
+    fn regex_detects_card_ip_iban() {
+        let r = RegexRecognizer::defaults();
+        let cases = [
+            (
+                "pay 4111 1111 1111 1111 now",
+                EntityKind::CreditCard,
+                "4111 1111 1111 1111",
+            ),
+            ("host 192.168.0.1 up", EntityKind::IpAddress, "192.168.0.1"),
+            (
+                "iban GB82WEST12345698765432 ok",
+                EntityKind::Iban,
+                "GB82WEST12345698765432",
+            ),
+        ];
+        for (text, kind, expect) in cases {
+            let found = r.detect(text);
+            assert!(
+                found
+                    .iter()
+                    .any(|e| e.kind == kind && &text[e.span.clone()] == expect),
+                "{kind:?} not found in {text:?}: {found:?}"
+            );
+        }
     }
 
     #[test]
