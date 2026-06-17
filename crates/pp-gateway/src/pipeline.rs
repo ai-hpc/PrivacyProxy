@@ -53,9 +53,9 @@ fn anonymize_descriptions(
 }
 
 /// Anonymise the outbound request in place: message content, assistant
-/// tool-call arguments, and tool-schema descriptions. One vault for the whole
-/// request keeps placeholders consistent. Returns the audit trail (metadata
-/// only — never plaintext).
+/// tool-call arguments, replayed `reasoning`, and tool-schema descriptions. One
+/// vault for the whole request keeps placeholders consistent. Returns the audit
+/// trail (metadata only — never plaintext).
 ///
 /// Structural tool fields (function/parameter *names*, enum values) are left
 /// untouched: they can't carry the `__…__` sentinel (function-name charset), and
@@ -94,6 +94,13 @@ pub fn anonymize_request(
                 {
                     anon_into(args, ensemble, vault, &mut audit);
                 }
+            }
+        }
+        // Replayed model reasoning (some clients echo it back on the next turn)
+        // is free text that can carry private terms — anonymise it like content.
+        for key in ["reasoning", "reasoning_content"] {
+            if let Some(Value::String(r)) = msg.extra.get_mut(key) {
+                anon_into(r, ensemble, vault, &mut audit);
             }
         }
     }
@@ -411,6 +418,29 @@ mod tests {
         assert!(
             body.contains("read_file"),
             "function name should be untouched"
+        );
+    }
+
+    #[test]
+    fn anonymizes_replayed_reasoning() {
+        // Some clients replay the model's prior `reasoning` on the next turn;
+        // it's free text that can carry private terms and must be masked.
+        let vault = MemVault::new();
+        let mut req: ChatRequest = serde_json::from_value(json!({
+            "model": "x",
+            "messages": [{
+                "role": "assistant",
+                "content": "done",
+                "reasoning": "The user mentioned Falcon, so I checked Falcon's status."
+            }]
+        }))
+        .expect("valid request");
+        anonymize_request(&mut req, &floor(), &vault);
+        let body = serde_json::to_value(&req).expect("serialise").to_string();
+        assert!(!body.contains("Falcon"), "reasoning leaked Falcon: {body}");
+        assert!(
+            body.contains("__PROJECT_1__"),
+            "reasoning not masked: {body}"
         );
     }
 
