@@ -271,6 +271,11 @@ async fn chat_completions(
     } else {
         match state.provider.chat(&sanitized, needs_tools).await {
             Ok(mut resp) => {
+                // Recover any tool call the model emitted as text in a non-OpenAI
+                // format, before rehydration restores placeholders in its args.
+                if needs_tools {
+                    pipeline::rescue_response(&mut resp);
+                }
                 pipeline::rehydrate_response(&mut resp, &*vault);
                 Json(resp).into_response()
             }

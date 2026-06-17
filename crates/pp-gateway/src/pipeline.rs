@@ -125,6 +125,150 @@ pub fn rehydrate_response(value: &mut Value, vault: &dyn Vault) {
     }
 }
 
+/// Recover a tool call the model emitted as **text** in a non-OpenAI format and
+/// re-emit it in the canonical `tool_calls` schema, so the agent's tool loop
+/// doesn't break on a free model that ignores the function-calling contract.
+/// Recognises Mistral `[TOOL_CALLS]name{args}`, Qwen `<tool_call>…</tool_call>`
+/// XML, and fenced/bare JSON `{"name":…,"arguments":…}`.
+///
+/// No-op when the message already has `tool_calls` or no call is recoverable.
+/// Buffered-path only (a call split across SSE frames can't be reassembled
+/// mid-stream); the gateway gates this on `needs_tools` to avoid mistaking a
+/// legitimate JSON answer for a tool call.
+pub fn rescue_response(value: &mut Value) {
+    let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for (i, choice) in choices.iter_mut().enumerate() {
+        // Read-only inspection first, so the later mutable borrows don't overlap.
+        let recovered = {
+            let Some(msg) = choice.get("message") else {
+                continue;
+            };
+            let has_calls = msg
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|a| !a.is_empty());
+            if has_calls {
+                continue;
+            }
+            let Some(content) = msg.get("content").and_then(Value::as_str) else {
+                continue;
+            };
+            parse_tool_call(content)
+        };
+        let Some((name, args)) = recovered else {
+            continue;
+        };
+        if let Some(msg) = choice.get_mut("message").and_then(Value::as_object_mut) {
+            msg.insert(
+                "tool_calls".into(),
+                json!([{
+                    "id": format!("call_rescue_{i}"),
+                    "type": "function",
+                    "function": { "name": name, "arguments": args },
+                }]),
+            );
+            msg.insert("content".into(), Value::Null);
+        }
+        if let Some(obj) = choice.as_object_mut() {
+            obj.insert("finish_reason".into(), json!("tool_calls"));
+        }
+    }
+}
+
+/// Try each known wrong-format tool-call encoding; return `(name, args)` where
+/// `args` is a JSON-encoded string (the canonical `function.arguments` shape).
+fn parse_tool_call(content: &str) -> Option<(String, String)> {
+    parse_mistral(content)
+        .or_else(|| parse_qwen(content))
+        .or_else(|| parse_json_call(content))
+}
+
+/// Mistral: `[TOOL_CALLS]name{json}` or `[TOOL_CALLS][{"name":…,"arguments":…}]`.
+fn parse_mistral(content: &str) -> Option<(String, String)> {
+    let rest = content.split("[TOOL_CALLS]").nth(1)?.trim_start();
+    if rest.starts_with('[') || rest.starts_with('{') {
+        return parse_json_call(rest);
+    }
+    let brace = rest.find('{')?;
+    let name = rest[..brace].trim().trim_matches('"').to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let obj = first_json(&rest[brace..])?;
+    let args: Value = serde_json::from_str(obj).ok()?;
+    Some((name, args.to_string()))
+}
+
+/// Qwen: `<tool_call>{"name":…,"arguments":…}</tool_call>`.
+fn parse_qwen(content: &str) -> Option<(String, String)> {
+    let start = content.find("<tool_call>")? + "<tool_call>".len();
+    let after = &content[start..];
+    let end = after.find("</tool_call>").unwrap_or(after.len());
+    parse_json_call(after[..end].trim())
+}
+
+/// Fenced or bare JSON: the first balanced `{...}`/`[...]` carrying a `name`
+/// plus `arguments`/`parameters` (object or already-stringified).
+fn parse_json_call(s: &str) -> Option<(String, String)> {
+    let v: Value = serde_json::from_str(first_json(s)?).ok()?;
+    let call = if let Some(arr) = v.as_array() {
+        arr.first()?.clone()
+    } else {
+        v
+    };
+    let name = call
+        .get("name")
+        .or_else(|| call.get("function").and_then(|f| f.get("name")))
+        .and_then(Value::as_str)?
+        .to_string();
+    let args_val = call
+        .get("arguments")
+        .or_else(|| call.get("parameters"))
+        .or_else(|| call.get("function").and_then(|f| f.get("arguments")))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let args = match args_val {
+        Value::String(s) => s,      // already a JSON-encoded string
+        other => other.to_string(), // serialise object/array to a string
+    };
+    Some((name, args))
+}
+
+/// The first balanced `{...}` or `[...]` substring, respecting string literals.
+fn first_json(s: &str) -> Option<&str> {
+    let b = s.as_bytes();
+    let start = b.iter().position(|&c| c == b'{' || c == b'[')?;
+    let (open, close) = if b[start] == b'{' {
+        (b'{', b'}')
+    } else {
+        (b'[', b']')
+    };
+    let (mut depth, mut in_str, mut esc) = (0i32, false, false);
+    for (i, &c) in b.iter().enumerate().skip(start) {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == b'\\' {
+                esc = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+        } else if c == b'"' {
+            in_str = true;
+        } else if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&s[start..=i]);
+            }
+        }
+    }
+    None
+}
+
 /// Per-stream rehydration state: one [`StreamRehydrator`] per content stream
 /// (keyed by choice index) and one per tool-call argument stream (keyed by
 /// choice + tool-call index), since each is an independent fragment sequence.
@@ -299,6 +443,80 @@ mod tests {
             body.contains("https://host/Falcon.png"),
             "image part should pass through: {body}"
         );
+    }
+
+    fn rescued(content: &str) -> Value {
+        let mut v = json!({"choices":[{"message":{"role":"assistant","content": content}}]});
+        rescue_response(&mut v);
+        v
+    }
+
+    #[test]
+    fn rescue_mistral_name_brace_args() {
+        let v = rescued("[TOOL_CALLS]get_weather{\"city\": \"Paris\"}");
+        let f = &v["choices"][0]["message"]["tool_calls"][0]["function"];
+        assert_eq!(f["name"], json!("get_weather"));
+        let args: Value = serde_json::from_str(f["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["city"], json!("Paris"));
+        assert_eq!(v["choices"][0]["finish_reason"], json!("tool_calls"));
+        assert!(v["choices"][0]["message"]["content"].is_null());
+    }
+
+    #[test]
+    fn rescue_qwen_xml() {
+        let v = rescued(
+            "<tool_call>{\"name\": \"search\", \"arguments\": {\"q\": \"rust\"}}</tool_call>",
+        );
+        let f = &v["choices"][0]["message"]["tool_calls"][0]["function"];
+        assert_eq!(f["name"], json!("search"));
+        let args: Value = serde_json::from_str(f["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["q"], json!("rust"));
+    }
+
+    #[test]
+    fn rescue_fenced_json() {
+        let v = rescued(
+            "Sure!\n```json\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.md\"}}\n```",
+        );
+        assert_eq!(
+            v["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            json!("read_file")
+        );
+    }
+
+    #[test]
+    fn rescue_is_noop_without_a_call_or_when_already_present() {
+        // Plain prose → untouched.
+        let v = rescued("The weather is sunny today.");
+        assert!(v["choices"][0]["message"]["tool_calls"].is_null());
+        assert_eq!(
+            v["choices"][0]["message"]["content"],
+            json!("The weather is sunny today.")
+        );
+
+        // Already-canonical tool_calls → untouched.
+        let mut v2 = json!({"choices":[{"message":{"role":"assistant","content":null,
+            "tool_calls":[{"id":"c1","type":"function","function":{"name":"x","arguments":"{}"}}]}}]});
+        rescue_response(&mut v2);
+        assert_eq!(
+            v2["choices"][0]["message"]["tool_calls"][0]["id"],
+            json!("c1")
+        );
+    }
+
+    #[test]
+    fn rescue_then_rehydrate_restores_args() {
+        // A rescued Mistral call whose argument is a placeholder must rehydrate.
+        let vault = MemVault::new();
+        vault.intern("Falcon", &EntityKind::Custom("project".into())); // __PROJECT_1__
+        let mut v = json!({"choices":[{"message":{"role":"assistant",
+            "content":"[TOOL_CALLS]open{\"project\": \"__PROJECT_1__\"}"}}]});
+        rescue_response(&mut v);
+        rehydrate_response(&mut v, &vault);
+        let args = v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        assert!(args.contains("Falcon"), "args not rehydrated: {args}");
     }
 
     #[test]
