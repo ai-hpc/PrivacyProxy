@@ -19,6 +19,7 @@ pub enum EntityKind {
     Location,
     Email,
     Phone,
+    Ssn,
     FilePath,
     Secret(SecretClass),
     /// User private-vocabulary tag, e.g. `Custom("project")`.
@@ -44,6 +45,7 @@ impl EntityKind {
             EntityKind::Location => "LOC".into(),
             EntityKind::Email => "EMAIL".into(),
             EntityKind::Phone => "PHONE".into(),
+            EntityKind::Ssn => "SSN".into(),
             EntityKind::FilePath => "PATH".into(),
             EntityKind::Secret(_) => "SECRET".into(),
             EntityKind::Custom(s) => s.to_ascii_uppercase(),

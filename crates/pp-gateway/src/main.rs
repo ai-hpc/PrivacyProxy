@@ -26,6 +26,7 @@ use pp_anonymize::egress_guard;
 use pp_core::{Detector, EgressPolicy, Embedder, EntityKind, Memory, Vault};
 use pp_detect::{
     EmailRecognizer, Ensemble, EntropyRecognizer, GazetteerRecognizer, LocalLlmRecognizer,
+    RegexRecognizer,
 };
 use pp_protocol::{ChatRequest, Message};
 use pp_store::{HashEmbedder, LayeredVault, MemVault, MemoryStore, SqliteVault};
@@ -207,6 +208,7 @@ async fn chat_completions(
         detectors.push(Box::new(GazetteerRecognizer::new(terms)));
     }
     detectors.push(Box::new(EmailRecognizer));
+    detectors.push(Box::new(RegexRecognizer::defaults()));
     detectors.push(Box::new(EntropyRecognizer::default()));
     if let Some(llm) = &state.llm {
         let found = llm.scan(&gather_text(&req)).await;
@@ -397,6 +399,7 @@ fn build_guard(vocab: &[(String, EntityKind)]) -> Ensemble {
         detectors.push(Box::new(GazetteerRecognizer::new(vocab.to_vec())));
     }
     detectors.push(Box::new(EmailRecognizer));
+    detectors.push(Box::new(RegexRecognizer::defaults()));
     Ensemble::new(detectors)
 }
 

@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 use pp_core::{Detector, DetectorId, Entity, EntityKind, SecretClass};
+use regex::Regex;
 use serde_json::{json, Value};
 
 /// Runs every detector and reconciles overlapping spans into a clean,
@@ -267,6 +268,58 @@ fn shannon_entropy(s: &str) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Regex — structured PII (SSN, phone, ...) via high-precision patterns.
+// ---------------------------------------------------------------------------
+
+/// Matches structured PII by regular expression; each pattern maps to a kind.
+/// Part of the deterministic floor (priority 3).
+pub struct RegexRecognizer {
+    patterns: Vec<(Regex, EntityKind)>,
+}
+
+impl RegexRecognizer {
+    /// Compile `(pattern, kind)` pairs; invalid patterns are skipped.
+    pub fn new(patterns: Vec<(&str, EntityKind)>) -> Self {
+        let patterns = patterns
+            .into_iter()
+            .filter_map(|(p, k)| Regex::new(p).ok().map(|re| (re, k)))
+            .collect();
+        Self { patterns }
+    }
+
+    /// Built-in structured-PII patterns: US SSN and NANP-style phone numbers.
+    pub fn defaults() -> Self {
+        Self::new(vec![
+            (r"\b\d{3}-\d{2}-\d{4}\b", EntityKind::Ssn),
+            (r"\+?\d{1,4}(?:[ .\-]\d{3,4}){2,4}", EntityKind::Phone),
+        ])
+    }
+}
+
+impl Detector for RegexRecognizer {
+    fn id(&self) -> DetectorId {
+        DetectorId("regex")
+    }
+    fn priority(&self) -> u8 {
+        3
+    }
+    fn detect(&self, text: &str) -> Vec<Entity> {
+        let mut out = Vec::new();
+        for (re, kind) in &self.patterns {
+            for m in re.find_iter(text) {
+                out.push(Entity {
+                    span: m.start()..m.end(),
+                    kind: kind.clone(),
+                    score: 0.9,
+                    source: self.id(),
+                });
+            }
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LocalLlmRecognizer — OPTIONAL semantic detector via a local OpenAI-compatible
 // LLM (e.g. llama.cpp serving Falcon-H1-0.5B-Instruct). Best-effort recall
 // beyond the deterministic floor; on ANY error it returns nothing, so the
@@ -453,6 +506,23 @@ mod tests {
         let es = EmailRecognizer.detect(s);
         assert_eq!(es.len(), 1);
         assert_eq!(&s[es[0].span.clone()], "a@b.com");
+    }
+
+    #[test]
+    fn regex_detects_ssn_and_phone() {
+        let r = RegexRecognizer::defaults();
+        let s = "SSN 000-12-3456, call +1-555-0198 today";
+        let found = r.detect(s);
+        assert!(
+            found
+                .iter()
+                .any(|e| e.kind == EntityKind::Ssn && &s[e.span.clone()] == "000-12-3456"),
+            "SSN not detected: {found:?}"
+        );
+        assert!(
+            found.iter().any(|e| e.kind == EntityKind::Phone),
+            "phone not detected: {found:?}"
+        );
     }
 
     #[test]

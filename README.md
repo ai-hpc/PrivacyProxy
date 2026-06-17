@@ -79,7 +79,10 @@ The deterministic detection floor — pure Rust, no external services:
 
 - **Private vocabulary** — your terms from `PRIVACYPROXY_VOCAB` (the primary, most reliable detector).
 - **Emails** — `local@domain.tld`.
+- **Structured PII** — US Social Security numbers and phone numbers, via high-precision regex patterns.
 - **Secrets** — high-entropy tokens (API keys and the like), redacted **irreversibly**: the model sees `__SECRET_1__` and it is never restored.
+
+Free-form **names and addresses** are *not* caught by the deterministic floor — add them to your vocabulary (or a `local_only` memory), or enable the local semantic detector.
 
 Reversible entities round-trip (placeholder out, real value back); secrets are redact-only. The same vault drives message content, tool-call arguments, and tool descriptions.
 
@@ -126,7 +129,7 @@ curl -s localhost:8080/v1/memory/export   # human-auditable Markdown of what's s
 ## Limitations (honest)
 
 - **Structural tool fields** (function names, parameter keys) aren't anonymized — they can't carry the placeholder sentinel. If one contains PII, the egress guard **blocks** the request (fail-closed) rather than leak it.
-- **The guarantee is the deterministic floor** (vocabulary + email + secrets). The optional local LLM adds best-effort recall but isn't part of the guarantee, and its quality depends on the model you run. A dedicated ONNX in-process NER is a future backend behind the same seam.
+- **The guarantee is the deterministic floor** (vocabulary + email + SSN/phone patterns + secrets). The optional local LLM adds best-effort recall but isn't part of the guarantee, and its quality depends on the model you run. A dedicated ONNX in-process NER is a future backend behind the same seam.
 - **Two-layer vault** — known vocabulary persists durably (SQLite); emails/secrets/discovered entities are ephemeral per request. Stored originals can be **encrypted at rest** (AES-256-GCM) by setting `PRIVACYPROXY_DB_KEY`; otherwise they're plaintext in the local (git-ignored) DB.
 - **Output quality** ≈ free-model ceiling × context surviving anonymization. Coding and agent work fit best, since logic and structure survive masking.
 
