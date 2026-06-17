@@ -877,6 +877,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pp-eval"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pp-anonymize",
+ "pp-core",
+ "pp-detect",
+ "pp-store",
+ "pp-upstream",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "pp-gateway"
 version = "0.1.0"
 dependencies = [
