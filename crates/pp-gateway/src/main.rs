@@ -4,6 +4,7 @@
 //! buffered and streaming (`ARCHITECTURE.md` §4, §5, §7, §10, §12).
 #![forbid(unsafe_code)]
 
+mod anthropic;
 mod pipeline;
 
 use std::convert::Infallible;
@@ -140,21 +141,22 @@ fn app(state: SharedState) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/messages", post(messages))
         .route("/v1/memory", post(memory_add).get(memory_list))
         .route("/v1/memory/export", get(memory_export))
         .route("/v1/memory/:id", delete(memory_delete))
         .with_state(state)
 }
 
-async fn chat_completions(
-    State(state): State<SharedState>,
-    headers: HeaderMap,
-    Json(mut req): Json<ChatRequest>,
-) -> Response {
-    if !authorized(&state, &headers) {
-        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
-    }
-
+/// Shared outbound pipeline for both API surfaces: recall + inject memory, build
+/// the per-request floor and a matching precise egress guard, anonymise, and
+/// fail closed if anything leaked. Returns the sanitised upstream payload, the
+/// request vault (for rehydration), and whether tools are present — or an
+/// error `Response`. One code path keeps the privacy guarantee single-sourced.
+async fn prepare_outbound(
+    state: &AppState,
+    mut req: ChatRequest,
+) -> Result<(Value, Arc<dyn Vault>, bool), Response> {
     // Per-request vault: durable personal layer (shared) + a fresh ephemeral
     // session layer. Placeholders are consistent within the request and never
     // leak to the client; known vocabulary stays stable across runs.
@@ -223,16 +225,15 @@ async fn chat_completions(
 
     let audit = pipeline::anonymize_request(&mut req, &anonymizer, &*vault);
     let needs_tools = req.has_tools();
-    let streaming = req.stream == Some(true);
 
     let sanitized = match serde_json::to_value(&req) {
         Ok(v) => v,
         Err(e) => {
-            return (
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("serialise error: {e}"),
             )
-                .into_response()
+                .into_response())
         }
     };
 
@@ -242,7 +243,7 @@ async fn chat_completions(
             count = leaks.len(),
             "egress guard tripped — blocking request"
         );
-        return (
+        return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({ "error": {
                 "message": "request blocked: detected un-anonymised sensitive data in a \
@@ -250,37 +251,88 @@ async fn chat_completions(
                 "type": "privacy_egress_guard"
             }})),
         )
-            .into_response();
+            .into_response());
     }
 
     tracing::info!(
         redactions = audit.len(),
         needs_tools,
-        streaming,
         "forwarding sanitised request"
     );
     // Post-guard, so this contains no detected sensitive data — safe to log.
     // Gives operators a way to inspect exactly what crosses the cloud boundary.
     tracing::debug!(payload = %sanitized, "egress payload (anonymised)");
+    Ok((sanitized, vault, needs_tools))
+}
 
-    if streaming {
+/// Run a buffered (non-streaming) request through the pipeline and return the
+/// rehydrated OpenAI response value — rescuing wrong-format tool calls first.
+async fn run_buffered(state: &AppState, req: ChatRequest) -> Result<Value, Response> {
+    let (sanitized, vault, needs_tools) = prepare_outbound(state, req).await?;
+    match state.provider.chat(&sanitized, needs_tools).await {
+        Ok(mut resp) => {
+            if needs_tools {
+                pipeline::rescue_response(&mut resp);
+            }
+            pipeline::rehydrate_response(&mut resp, &*vault);
+            Ok(resp)
+        }
+        Err(err) => Err(provider_error_response(err)),
+    }
+}
+
+async fn chat_completions(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<ChatRequest>,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
+    if req.stream == Some(true) {
+        let (sanitized, vault, needs_tools) = match prepare_outbound(&state, req).await {
+            Ok(t) => t,
+            Err(resp) => return resp,
+        };
         match state.provider.chat_stream(&sanitized, needs_tools).await {
             Ok(upstream) => sse_rehydrated(upstream, vault).into_response(),
             Err(err) => provider_error_response(err),
         }
     } else {
-        match state.provider.chat(&sanitized, needs_tools).await {
-            Ok(mut resp) => {
-                // Recover any tool call the model emitted as text in a non-OpenAI
-                // format, before rehydration restores placeholders in its args.
-                if needs_tools {
-                    pipeline::rescue_response(&mut resp);
-                }
-                pipeline::rehydrate_response(&mut resp, &*vault);
-                Json(resp).into_response()
-            }
-            Err(err) => provider_error_response(err),
+        match run_buffered(&state, req).await {
+            Ok(resp) => Json(resp).into_response(),
+            Err(resp) => resp,
         }
+    }
+}
+
+/// Anthropic Messages API (`POST /v1/messages`) so Anthropic-native clients
+/// (e.g. Claude Code) can use the gateway unchanged. The body is converted to
+/// the OpenAI shape, run through the same privacy pipeline, and converted back.
+/// Buffered only for now — Anthropic SSE translation is a follow-up, so a
+/// `stream: true` request still receives a single buffered message.
+async fn messages(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
+    let req = match anthropic::to_chat_request(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "type": "error",
+                    "error": { "type": "invalid_request_error", "message": e } })),
+            )
+                .into_response()
+        }
+    };
+    match run_buffered(&state, req).await {
+        Ok(openai) => Json(anthropic::from_chat_response(&openai)).into_response(),
+        Err(resp) => resp,
     }
 }
 

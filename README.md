@@ -20,13 +20,16 @@ Early but working. The M1 core is functional and **validated live** against Open
 |---|---|
 | OpenAI `/v1/chat/completions` (buffered) | ✅ |
 | Streaming (SSE) with split-safe rehydration | ✅ |
+| Anthropic Messages API (`/v1/messages`, buffered) — for Claude Code & co. | ✅ |
 | Agent tool-calling (tools schema + tool-call arguments) | ✅ |
+| Tool-call rescue for non-OpenAI formats (Mistral / Qwen / JSON) | ✅ |
 | Capability-aware failover across free models | ✅ |
 | Fail-closed egress guard | ✅ |
 | Optional on-device semantic detection (local LLM) | ✅ (opt-in) |
 | Local memory (M2): recall · policy-filtered injection · audit export | ✅ |
+| Quality eval harness (`pp-eval`): baseline vs. anonymised, leak check | ✅ |
 
-Not yet: dedicated ONNX in-process NER, multimodal content, conversational memory extraction. See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full design. The **M2 local-memory** system (adapted from [genie-claw](https://github.com/GeniePod/genie-claw)) is designed and implemented per **[doc/MEMORY.md](doc/MEMORY.md)**.
+Not yet: dedicated ONNX in-process NER, multimodal *image* anonymisation, Anthropic SSE streaming (the `/v1/messages` endpoint responds buffered for now), conversational memory extraction. See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full design. The **M2 local-memory** system (adapted from [genie-claw](https://github.com/GeniePod/genie-claw)) is designed and implemented per **[doc/MEMORY.md](doc/MEMORY.md)**.
 
 ## How it works
 
