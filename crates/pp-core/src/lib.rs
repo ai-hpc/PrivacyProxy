@@ -153,3 +153,10 @@ pub struct Memory {
     pub egress_policy: EgressPolicy,
     pub created_ms: i64,
 }
+
+/// Computes a fixed-length embedding for text — the semantic-recall provider
+/// boundary (`doc/MEMORY.md`). `pp-store` ships a deterministic hash embedder;
+/// a neural / local-model embedder can plug in behind this same trait.
+pub trait Embedder: Send + Sync {
+    fn embed(&self, text: &str) -> Vec<f32>;
+}

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit};
-use pp_core::{EgressPolicy, EntityKind, Memory, Placeholder, Vault};
+use pp_core::{EgressPolicy, Embedder, EntityKind, Memory, Placeholder, Vault};
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 
@@ -337,9 +337,11 @@ impl Vault for LayeredVault {
 // *searchable* store is a separate, harder problem and is deferred.)
 // ---------------------------------------------------------------------------
 
-/// SQLite + FTS5 backed store of recallable memories.
+/// SQLite + FTS5 backed store of recallable memories, with optional semantic
+/// recall via an [`Embedder`].
 pub struct MemoryStore {
     conn: Mutex<Connection>,
+    embedder: Option<Arc<dyn Embedder>>,
 }
 
 fn init_memory_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -351,24 +353,44 @@ fn init_memory_schema(conn: &Connection) -> rusqlite::Result<()> {
             egress_policy TEXT NOT NULL,
             created_ms    INTEGER NOT NULL
         );
-        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id UNINDEXED, content);",
+        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id UNINDEXED, content);
+        CREATE TABLE IF NOT EXISTS embeddings (
+            memory_id TEXT PRIMARY KEY,
+            dim       INTEGER NOT NULL,
+            vector    BLOB NOT NULL
+        );",
     )
 }
 
 impl MemoryStore {
     pub fn open(path: &str) -> rusqlite::Result<Self> {
+        Self::open_with_embedder(path, None)
+    }
+
+    pub fn in_memory() -> rusqlite::Result<Self> {
+        Self::in_memory_with_embedder(None)
+    }
+
+    /// Open at `path`, enabling semantic recall when `embedder` is `Some`.
+    pub fn open_with_embedder(
+        path: &str,
+        embedder: Option<Arc<dyn Embedder>>,
+    ) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
         init_memory_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            embedder,
         })
     }
 
-    pub fn in_memory() -> rusqlite::Result<Self> {
+    /// In-memory store (mainly for tests), with optional semantic recall.
+    pub fn in_memory_with_embedder(embedder: Option<Arc<dyn Embedder>>) -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         init_memory_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            embedder,
         })
     }
 
@@ -395,6 +417,13 @@ impl MemoryStore {
             params![id, content],
         )
         .ok()?;
+        if let Some(embedder) = &self.embedder {
+            let vector = embedder.embed(content);
+            let _ = conn.execute(
+                "INSERT INTO embeddings (memory_id, dim, vector) VALUES (?1, ?2, ?3)",
+                params![id, vector.len() as i64, encode_vec(&vector)],
+            );
+        }
         Some(Memory {
             id,
             content: content.to_string(),
@@ -407,6 +436,7 @@ impl MemoryStore {
     pub fn delete(&self, id: &str) -> bool {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let _ = conn.execute("DELETE FROM memories_fts WHERE id = ?1", params![id]);
+        let _ = conn.execute("DELETE FROM embeddings WHERE memory_id = ?1", params![id]);
         conn.execute("DELETE FROM memories WHERE id = ?1", params![id])
             .map(|n| n > 0)
             .unwrap_or(false)
@@ -458,6 +488,40 @@ impl MemoryStore {
             .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
             .unwrap_or_default()
     }
+
+    /// Semantic recall via cosine similarity over stored embeddings (brute
+    /// force — fine at personal scale). Empty if no embedder is configured.
+    pub fn semantic_recall(&self, text: &str, limit: usize) -> Vec<Memory> {
+        let Some(embedder) = &self.embedder else {
+            return Vec::new();
+        };
+        let query = embedder.embed(text);
+        if query.iter().all(|x| *x == 0.0) {
+            return Vec::new();
+        }
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT m.id, m.content, m.kind, m.egress_policy, m.created_ms, e.vector
+             FROM embeddings e JOIN memories m ON m.id = e.memory_id",
+        ) else {
+            return Vec::new();
+        };
+        let rows = stmt
+            .query_map([], |row| {
+                let memory = row_to_memory(row)?;
+                let bytes: Vec<u8> = row.get(5)?;
+                Ok((memory, decode_vec(&bytes)))
+            })
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+            .unwrap_or_default();
+        let mut scored: Vec<(f32, Memory)> = rows
+            .into_iter()
+            .map(|(memory, vector)| (cosine(&query, &vector), memory))
+            .filter(|(score, _)| *score > 0.0)
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().take(limit).map(|(_, m)| m).collect()
+    }
 }
 
 fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
@@ -488,6 +552,74 @@ fn fts_query(text: &str) -> String {
         }
     }
     terms.join(" OR ")
+}
+
+// ---------------------------------------------------------------------------
+// Semantic embedding (M2 Phase 2) — provider boundary + default impl.
+// ---------------------------------------------------------------------------
+
+/// Deterministic feature-hash embedder: tokens are signed-hashed into a fixed
+/// vector and L2-normalised, so cosine similarity reflects token overlap. No
+/// model, no network — a placeholder that proves the [`Embedder`] boundary; a
+/// neural / concept-expanding embedder can replace it behind the same trait.
+pub struct HashEmbedder {
+    dim: usize,
+}
+
+impl HashEmbedder {
+    pub fn new(dim: usize) -> Self {
+        Self { dim: dim.max(1) }
+    }
+}
+
+impl Default for HashEmbedder {
+    fn default() -> Self {
+        Self::new(64)
+    }
+}
+
+impl Embedder for HashEmbedder {
+    fn embed(&self, text: &str) -> Vec<f32> {
+        let mut v = vec![0f32; self.dim];
+        for token in text.split(|c: char| !c.is_alphanumeric()) {
+            if token.len() < 2 {
+                continue;
+            }
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            token.to_ascii_lowercase().hash(&mut hasher);
+            let h = hasher.finish();
+            let idx = (h % self.dim as u64) as usize;
+            let sign = if (h >> 1) & 1 == 0 { 1.0 } else { -1.0 };
+            v[idx] += sign;
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for x in &mut v {
+                *x /= norm;
+            }
+        }
+        v
+    }
+}
+
+fn encode_vec(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+fn decode_vec(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Cosine similarity of two (already L2-normalised) vectors = their dot product.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
 #[cfg(test)]
@@ -545,6 +677,47 @@ mod tests {
             .iter()
             .any(|x| x.content.contains("Falcon")));
         assert!(m.recall("zzz", 8).is_empty()); // no usable tokens / no match
+    }
+
+    #[test]
+    fn hash_embedder_deterministic_and_token_aware() {
+        let e = HashEmbedder::default();
+        assert_eq!(e.embed("dark roast coffee"), e.embed("dark roast coffee"));
+        let base = e.embed("dark roast coffee");
+        let shared = cosine(&base, &e.embed("i love dark roast coffee"));
+        let unrelated = cosine(&base, &e.embed("quantum chromodynamics lecture"));
+        assert!(shared > unrelated, "shared tokens: {shared} vs {unrelated}");
+    }
+
+    #[test]
+    fn semantic_recall_returns_related_and_empty_without_embedder() {
+        let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default());
+        let m = MemoryStore::in_memory_with_embedder(Some(embedder)).expect("mem");
+        m.add(
+            "User prefers dark roast coffee",
+            "preference",
+            EgressPolicy::Anonymized,
+            1,
+        )
+        .expect("add");
+        m.add(
+            "The garage code is 4242",
+            "fact",
+            EgressPolicy::Anonymized,
+            2,
+        )
+        .expect("add");
+        assert!(m
+            .semantic_recall("what coffee does the user like", 3)
+            .iter()
+            .any(|x| x.content.contains("coffee")));
+
+        // No embedder configured → no semantic recall (FTS still works).
+        let plain = MemoryStore::in_memory().expect("mem");
+        plain
+            .add("x", "fact", EgressPolicy::Anonymized, 1)
+            .expect("add");
+        assert!(plain.semantic_recall("x", 3).is_empty());
     }
 
     #[test]

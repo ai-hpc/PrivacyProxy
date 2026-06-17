@@ -23,12 +23,12 @@ use axum::{
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
 use pp_anonymize::egress_guard;
-use pp_core::{Detector, EgressPolicy, EntityKind, Memory, Vault};
+use pp_core::{Detector, EgressPolicy, Embedder, EntityKind, Memory, Vault};
 use pp_detect::{
     EmailRecognizer, Ensemble, EntropyRecognizer, GazetteerRecognizer, LocalLlmRecognizer,
 };
 use pp_protocol::{ChatRequest, Message};
-use pp_store::{LayeredVault, MemVault, MemoryStore, SqliteVault};
+use pp_store::{HashEmbedder, LayeredVault, MemVault, MemoryStore, SqliteVault};
 use pp_upstream::{
     ByteStream, ModelEntry, OpenRouterProvider, Provider, ProviderError, RouterConfig,
 };
@@ -96,12 +96,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let memory_db =
         env::var("PRIVACYPROXY_MEMORY_DB").unwrap_or_else(|_| "privacyproxy-memory.db".to_string());
+    let semantic = matches!(
+        env::var("PRIVACYPROXY_MEMORY_SEMANTIC").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    );
+    let embedder: Option<Arc<dyn Embedder>> =
+        semantic.then(|| Arc::new(HashEmbedder::default()) as Arc<dyn Embedder>);
     let memory: Arc<MemoryStore> = Arc::new(if memory_db == ":memory:" {
-        MemoryStore::in_memory()?
+        MemoryStore::in_memory_with_embedder(embedder)?
     } else {
-        MemoryStore::open(&memory_db)?
+        MemoryStore::open_with_embedder(&memory_db, embedder)?
     });
-    tracing::info!("memory store: {memory_db}");
+    tracing::info!(semantic, "memory store: {memory_db}");
 
     let vocab = parse_vocab();
 
@@ -161,7 +167,13 @@ async fn chat_completions(
     // M2: recall memories relevant to the request and inject the cloud-safe
     // ones as system context. They flow through anonymize below, so the cloud
     // only ever sees placeholders; `local_only` memories are never injected.
-    let recalled = state.memory.recall(&gather_text(&req), MEMORY_RECALL_K);
+    let mem_query = gather_text(&req);
+    let mut recalled = state.memory.recall(&mem_query, MEMORY_RECALL_K);
+    for m in state.memory.semantic_recall(&mem_query, MEMORY_RECALL_K) {
+        if !recalled.iter().any(|h| h.id == m.id) {
+            recalled.push(m); // fuse semantic hits (no-op unless an embedder is set)
+        }
+    }
     let injectable = select_injectable(recalled, MEMORY_BUDGET_TOKENS);
     if let Some(block) = memory_block(&injectable) {
         tracing::info!(memories = injectable.len(), "injecting recalled memory");
