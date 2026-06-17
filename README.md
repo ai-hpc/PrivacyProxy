@@ -23,8 +23,9 @@ Early but working. The M1 core is functional and **validated live** against Open
 | Agent tool-calling (tools schema + tool-call arguments) | ✅ |
 | Capability-aware failover across free models | ✅ |
 | Fail-closed egress guard | ✅ |
+| Optional on-device semantic detection (local LLM) | ✅ (opt-in) |
 
-Not yet: local NER/LLM detection, multimodal content. See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full design and roadmap.
+Not yet: dedicated ONNX in-process NER, multimodal content. See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full design and roadmap.
 
 ## How it works
 
@@ -81,6 +82,14 @@ The deterministic detection floor — pure Rust, no external services:
 
 Reversible entities round-trip (placeholder out, real value back); secrets are redact-only. The same vault drives message content, tool-call arguments, and tool descriptions.
 
+**Optional on-device semantic layer.** With `PRIVACYPROXY_LLM_URL` set, the gateway also asks a small local model to flag sensitive names the rules miss — people, organizations, projects. It's best-effort recall: if the model is unavailable, slow, or wrong, the deterministic floor still protects you. The model only ever sees your *local* text (it's part of the trusted layer) and is **never** part of the guarantee.
+
+```bash
+# e.g. via llama.cpp, on-device
+llama-server -m falcon-h1-0.5b-instruct.gguf --port 8081
+export PRIVACYPROXY_LLM_URL=http://127.0.0.1:8081
+```
+
 ## Configuration
 
 | Env var | Purpose | Default |
@@ -90,11 +99,13 @@ Reversible entities round-trip (placeholder out, real value back); secrets are r
 | `PRIVACYPROXY_LOCAL_KEY` | require `Authorization: Bearer <key>` from clients | unset → auth disabled (dev) |
 | `PRIVACYPROXY_BIND` | listen address | `127.0.0.1:8080` |
 | `PRIVACYPROXY_DB` | durable vault path (`:memory:` for ephemeral) | `privacyproxy.db` |
+| `PRIVACYPROXY_LLM_URL` | local OpenAI-compatible endpoint for semantic detection | unset (off) |
+| `PRIVACYPROXY_LLM_MODEL` | model name for the semantic detector | `falcon-h1-0.5b-instruct` |
 
 ## Limitations (honest)
 
 - **Structural tool fields** (function names, parameter keys) aren't anonymized — they can't carry the placeholder sentinel. If one contains PII, the egress guard **blocks** the request (fail-closed) rather than leak it.
-- **Detection is the deterministic floor only** — no semantic NER yet, so PII outside your vocabulary / emails / secrets isn't caught.
+- **The guarantee is the deterministic floor** (vocabulary + email + secrets). The optional local LLM adds best-effort recall but isn't part of the guarantee, and its quality depends on the model you run. A dedicated ONNX in-process NER is a future backend behind the same seam.
 - **Two-layer vault** — known vocabulary persists durably (SQLite); emails/secrets/discovered entities are ephemeral per request. Originals are stored as plaintext in the local DB (git-ignored); encryption at rest is a follow-up.
 - **Output quality** ≈ free-model ceiling × context surviving anonymization. Coding and agent work fit best, since logic and structure survive masking.
 
@@ -103,7 +114,7 @@ Reversible entities round-trip (placeholder out, real value back); secrets are r
 ```
 crates/
   pp-core        domain types + Detector/Vault traits (no I/O)
-  pp-detect      detection floor: gazetteer · email · entropy + reconciliation
+  pp-detect      detection: gazetteer · email · entropy · optional local-LLM
   pp-anonymize   anonymize · rehydrate · streaming StreamRehydrator · egress guard
   pp-store       vaults: in-memory · SQLite · two-layer (durable + ephemeral)
   pp-upstream    Provider + OpenRouter client with capability-aware failover
