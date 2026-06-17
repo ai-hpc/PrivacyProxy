@@ -14,3 +14,11 @@ pp-core = { path = "../pp-core" }
 pp-detect = { path = "../pp-detect" }
 pp-store = { path = "../pp-store" }
 pp-anonymize = { path = "../pp-anonymize" }
+pp-protocol = { path = "../pp-protocol" }
+pp-upstream = { path = "../pp-upstream" }
+
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

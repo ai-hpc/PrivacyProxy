@@ -8,7 +8,7 @@
 //! upstream is wired.
 #![forbid(unsafe_code)]
 
-use pp_core::{Redaction, Vault};
+use pp_core::{Entity, Redaction, Vault};
 use pp_detect::Ensemble;
 
 /// Result of anonymising text: the sanitized string plus an audit trail.
@@ -73,4 +73,63 @@ pub fn rehydrate(text: &str, vault: &dyn Vault) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Runtime egress guard (`ARCHITECTURE.md` §14): re-run detection over the
+/// already-sanitized payload. Anything still detected is an un-anonymised
+/// surface (e.g. a tool description the gateway doesn't rewrite yet) — the
+/// caller must **fail closed**.
+///
+/// Pass a *precise* ensemble (deterministic identifiers, not entropy): the
+/// guard runs over serialized JSON, where high-recall detectors would
+/// false-positive on benign high-entropy fields like `tool_call_id`s.
+pub fn egress_guard(sanitized: &str, guard: &Ensemble) -> Result<(), Vec<Entity>> {
+    let leaks = guard.detect(sanitized);
+    if leaks.is_empty() {
+        Ok(())
+    } else {
+        Err(leaks)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pp_core::EntityKind;
+    use pp_detect::{EmailRecognizer, EntropyRecognizer, GazetteerRecognizer};
+    use pp_store::MemVault;
+
+    fn floor() -> Ensemble {
+        Ensemble::new(vec![
+            Box::new(GazetteerRecognizer::new(vec![(
+                "Falcon".into(),
+                EntityKind::Custom("project".into()),
+            )])),
+            Box::new(EmailRecognizer),
+            Box::new(EntropyRecognizer::default()),
+        ])
+    }
+
+    fn precise_guard() -> Ensemble {
+        Ensemble::new(vec![
+            Box::new(GazetteerRecognizer::new(vec![(
+                "Falcon".into(),
+                EntityKind::Custom("project".into()),
+            )])),
+            Box::new(EmailRecognizer),
+        ])
+    }
+
+    #[test]
+    fn anonymize_then_guard_passes() {
+        let vault = MemVault::new();
+        let a = anonymize("ping me re Falcon at a@b.com", &floor(), &vault);
+        assert!(egress_guard(&a.text, &precise_guard()).is_ok());
+    }
+
+    #[test]
+    fn guard_fails_on_unredacted_identifier() {
+        // PII that slipped into a field the gateway did not anonymise.
+        assert!(egress_guard("tool desc: contact a@b.com", &precise_guard()).is_err());
+    }
 }

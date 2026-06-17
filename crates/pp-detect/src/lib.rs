@@ -151,12 +151,14 @@ impl Detector for EmailRecognizer {
                 while end < b.len() && is_domain(b[end]) {
                     end += 1;
                 }
+                // Don't swallow a trailing sentence dot into the domain
+                // (e.g. "a@b.com." → the email is "a@b.com").
+                while end > i + 1 && b[end - 1] == b'.' {
+                    end -= 1;
+                }
                 let domain = &b[i + 1..end];
-                let valid = start < i
-                    && domain.len() >= 3
-                    && domain.contains(&b'.')
-                    && domain[0] != b'.'
-                    && *domain.last().unwrap_or(&b'.') != b'.';
+                let valid =
+                    start < i && domain.len() >= 3 && domain.contains(&b'.') && domain[0] != b'.';
                 if valid {
                     out.push(Entity {
                         span: start..end,
@@ -266,6 +268,14 @@ mod tests {
             &"ping a.b@example.com now"[es[0].span.clone()],
             "a.b@example.com"
         );
+    }
+
+    #[test]
+    fn email_excludes_trailing_sentence_dot() {
+        let s = "mail me at a@b.com.";
+        let es = EmailRecognizer.detect(s);
+        assert_eq!(es.len(), 1);
+        assert_eq!(&s[es[0].span.clone()], "a@b.com");
     }
 
     #[test]
