@@ -1,0 +1,13 @@
+[package]
+name = "pp-anonymize"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pp-core = { path = "../pp-core" }
+pp-detect = { path = "../pp-detect" }
+
+[dev-dependencies]
+pp-store = { path = "../pp-store" }

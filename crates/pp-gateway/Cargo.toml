@@ -1,0 +1,16 @@
+[package]
+name = "pp-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "privacyproxy"
+path = "src/main.rs"
+
+[dependencies]
+pp-core = { path = "../pp-core" }
+pp-detect = { path = "../pp-detect" }
+pp-store = { path = "../pp-store" }
+pp-anonymize = { path = "../pp-anonymize" }
