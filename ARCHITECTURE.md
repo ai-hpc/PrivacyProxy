@@ -70,7 +70,7 @@ flowchart LR
 |---|---|---|
 | P1 | **Deterministic floor is the guarantee** | Regex + entropy + gazetteer (pure Rust, fast) own correctness. Statistical detection only *adds* recall. |
 | P2 | **Fail closed** | If the egress guard cannot prove safety, the request is blocked, not sent. |
-| P3 | **Reversible & session-consistent** | `Alex → ⟦PERSON_1⟧` is stable for an entire trajectory, or the model hallucinates multiple people. |
+| P3 | **Reversible & session-consistent** | `Alex → __PERSON_1__` is stable for an entire trajectory, or the model hallucinates multiple people. |
 | P4 | **Transparent transform** | The gateway never executes the agent's tools; it only transforms the wire. Any agent plugs in via `base_url`. |
 | P5 | **Tool output is the real surface** | An agent leaks through `cat .env` and stack traces, not through prose. Detection runs on results, not just prompts. |
 
@@ -94,15 +94,15 @@ sequenceDiagram
     V-->>G: stable placeholders
     Note over G,C: only sanitized bytes cross the boundary
     G->>C: anonymized request
-    C-->>G: tool_call read_file("⟦PROJECT_1⟧.md")
-    G->>V: resolve ⟦PROJECT_1⟧
+    C-->>G: tool_call read_file("__PROJECT_1__.md")
+    G->>V: resolve __PROJECT_1__
     V-->>G: "Falcon"
     G-->>A: tool_call read_file("Falcon.md")
     A->>A: execute locally
     Note over A: tool result = NEW PII surface
     A->>G: tool result (real file bytes)
     G->>V: intern new entities (same vault)
-    Note over G: re-anonymize FULL history every turn —<br/>determinism keeps ⟦PROJECT_1⟧ = Falcon
+    Note over G: re-anonymize FULL history every turn —<br/>determinism keeps __PROJECT_1__ = Falcon
     G->>C: next turn (anonymized)
     C-->>G: final answer (placeholders)
     G-->>A: rehydrated answer
@@ -387,7 +387,7 @@ pub fn anonymize(text: &str, detectors: &Ensemble, vault: &dyn Vault) -> Anonymi
 ```mermaid
 stateDiagram-v2
     [*] --> Scanning
-    Scanning --> Emitting: complete ⟦KIND_N⟧ found
+    Scanning --> Emitting: complete __KIND_N__ found
     Emitting --> Scanning: replace via vault.resolve()
     Scanning --> Holding: suffix could begin a sentinel
     Holding --> Scanning: next chunk rules it out
@@ -399,10 +399,10 @@ stateDiagram-v2
 ### Why a carry buffer (byte view)
 
 ```text
-chunk N    : ...the file ⟦PER              emit "...the file ", HOLD "⟦PER"
+chunk N    : ...the file __PER              emit "...the file ", HOLD "__PER"
                           └ partial sentinel → carry
-chunk N+1  : SON_1⟧ is large               carry + chunk = "⟦PERSON_1⟧ is large"
-                                           resolve ⟦PERSON_1⟧ → "Alex"
+chunk N+1  : SON_1__ is large               carry + chunk = "__PERSON_1__ is large"
+                                           resolve __PERSON_1__ → "Alex"
                                            emit "Alex is large"
 ```
 
@@ -413,14 +413,14 @@ Added latency is bounded to **one partial token**. The same buffering runs **ins
 pub struct RehydrateStream<S> {
     upstream: S,
     vault: Arc<dyn Vault>,
-    carry: String,   // bytes held back: a possible partial ⟦…⟧
+    carry: String,   // bytes held back: a possible partial __…__
 }
-// poll_next: append delta to carry → replace every complete ⟦…⟧ via vault.resolve()
+// poll_next: append delta to carry → replace every complete __…__ via vault.resolve()
 //            → emit safe prefix → retain longest suffix that could begin a sentinel.
 //            On upstream end: flush carry verbatim.
 ```
 
-**Placeholder format:** `⟦KIND_N⟧` (U+27E6 / U+27E7). Rationale: rare in natural text (low false-rehydrate risk), survives JSON escaping, and models treat it as opaque instead of "helpfully" rewriting `[PERSON_1]`.
+**Placeholder format:** `__KIND_N__` — all `[A-Za-z0-9_]`. Rationale (revised after live testing): the original guillemet sentinel did **not** round-trip — a free model's constrained tool-argument decoder stripped the delimiters, so the token came back bare and rehydration failed in tool calls (it survived in plain *content*). An underscore-delimited identifier is preserved verbatim by models, works in both content and tool-call paths, and is valid in the function-name charset. Rehydration only replaces tokens already in the vault, so collisions with real `__x__` text are safe no-ops.
 
 ---
 
@@ -431,7 +431,7 @@ The model never needs a literal API key to reason, and you must **not** rehydrat
 ```mermaid
 flowchart LR
     e["detected entity"] --> k{"kind?"}
-    k -->|"credential"| red["redact ⟦SECRET_n⟧<br/>IRREVERSIBLE"]
+    k -->|"credential"| red["redact __SECRET_n__<br/>IRREVERSIBLE"]
     k -->|"identifier"| rev1["reversible intern"]
     k -->|"structural PII"| rev2["reversible intern"]
     red --> never["never rehydrated<br/>agent already holds the real value"]
@@ -444,7 +444,7 @@ flowchart LR
 
 | Tier | Example | Mapping | Rehydrate? |
 |---|---|---|---|
-| Credential | API key, AWS secret, private key, JWT | redact `⟦SECRET_n⟧` | **No** — irreversible |
+| Credential | API key, AWS secret, private key, JWT | redact `__SECRET_n__` | **No** — irreversible |
 | Private identifier | name, project, employer | reversible intern | Yes |
 | Structural PII | path, email, phone | reversible intern | Yes |
 
@@ -552,7 +552,7 @@ ner       = false            # M2: local llama.cpp pass
 [policy]
 egress_guard = "fail_closed"
 credentials  = "redact_only" # irreversible
-placeholder  = "guillemet"   # ⟦KIND_N⟧
+placeholder  = "ascii"       # __KIND_N__
 
 [local]
 model   = "falcon-h1-0.5b"
@@ -590,7 +590,7 @@ flowchart TB
 | Decision | Choice | Why |
 |---|---|---|
 | Egress guard policy | **fail-closed** | privacy product; safety over convenience |
-| Placeholder format | `⟦KIND_N⟧` (U+27E6/7) | rare · JSON-safe · model-opaque |
+| Placeholder format | `__KIND_N__` (ASCII id) | preserved verbatim through content **and** tool-call decoders; the guillemet sentinel was not (live finding) |
 | Detection floor | regex + entropy + gazetteer (pure Rust) | the guarantee; deterministic & fast |
 | NER backend | `ort` (ONNX) or llama.cpp, **opt-in** | pure-Rust deploy on Jetson, no Python runtime |
 | Credentials | **redact-only** (irreversible) | model reasons over a marker; never write keys back |
