@@ -54,6 +54,13 @@ pub enum ProviderError {
     NoCandidates,
     #[error("all upstream models failed (last status: {0:?})")]
     AllFailed(Option<u16>),
+    #[error("upstream rate limited (429)")]
+    RateLimited {
+        /// Value of the upstream `Retry-After` header, if any (seconds or HTTP date).
+        retry_after: Option<String>,
+        /// Upstream error body, for surfacing context to the client.
+        detail: String,
+    },
     #[error("upstream returned status {0}: {1}")]
     Upstream(u16, String),
     #[error("transport error: {0}")]
@@ -81,10 +88,14 @@ pub trait Provider: Send + Sync {
 }
 
 /// Talks to OpenRouter's OpenAI-compatible endpoint, with capability-aware
-/// failover across the configured free models. Failover triggers on
-/// 429 / 5xx / transport errors; 4xx bodies are returned straight through.
-/// For streaming, failover applies to the initial response status only — once
-/// a model starts streaming, we commit to it.
+/// failover across the configured free models. Failover triggers on 5xx /
+/// transport errors; other 4xx bodies (incl. 402 out-of-credits) are returned
+/// straight through. A **429 is not failed over**: OpenRouter's free-tier rate
+/// limits (≈20 req/min, 50–1000 req/day) are per-account and shared across all
+/// `:free` models, so trying another model can't help and each failed attempt
+/// still burns a daily request — it's surfaced to the client (with any
+/// `Retry-After`) so it can back off. For streaming, failover applies to the
+/// initial response status only — once a model starts streaming, we commit to it.
 pub struct OpenRouterProvider {
     http: reqwest::Client,
     api_key: String,
@@ -154,9 +165,25 @@ impl Provider for OpenRouterProvider {
                         }
                     }
                     let code = status.as_u16();
-                    if code == 429 || status.is_server_error() {
+                    // 5xx / transient: fail over to the next model.
+                    if status.is_server_error() {
                         last = Some(ProviderError::AllFailed(Some(code)));
                         continue;
+                    }
+                    // 429: free-tier limits are per-account and shared across all
+                    // :free models, so failover can't help and each attempt still
+                    // burns a daily request. Surface it (with Retry-After) instead.
+                    if code == 429 {
+                        let retry_after = resp
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        let detail = resp.text().await.unwrap_or_default();
+                        return Err(ProviderError::RateLimited {
+                            retry_after,
+                            detail,
+                        });
                     }
                     let detail = resp.text().await.unwrap_or_default();
                     return Err(ProviderError::Upstream(code, detail));
@@ -203,9 +230,25 @@ impl Provider for OpenRouterProvider {
                         return Ok(boxed);
                     }
                     let code = status.as_u16();
-                    if code == 429 || status.is_server_error() {
+                    // 5xx / transient: fail over to the next model.
+                    if status.is_server_error() {
                         last = Some(ProviderError::AllFailed(Some(code)));
                         continue;
+                    }
+                    // 429: free-tier limits are per-account and shared across all
+                    // :free models, so failover can't help and each attempt still
+                    // burns a daily request. Surface it (with Retry-After) instead.
+                    if code == 429 {
+                        let retry_after = resp
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        let detail = resp.text().await.unwrap_or_default();
+                        return Err(ProviderError::RateLimited {
+                            retry_after,
+                            detail,
+                        });
                     }
                     let detail = resp.text().await.unwrap_or_default();
                     return Err(ProviderError::Upstream(code, detail));

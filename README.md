@@ -132,6 +132,7 @@ curl -s localhost:8080/v1/memory/export   # human-auditable Markdown of what's s
 - **The guarantee is the deterministic floor** (vocabulary + email + SSN/card/IP/IBAN/phone patterns + secrets). The optional local LLM adds best-effort recall but isn't part of the guarantee, and its quality depends on the model you run. A dedicated ONNX in-process NER is a future backend behind the same seam.
 - **Two-layer vault** — known vocabulary persists durably (SQLite); emails/secrets/discovered entities are ephemeral per request. Stored originals can be **encrypted at rest** (AES-256-GCM) by setting `PRIVACYPROXY_DB_KEY`; otherwise they're plaintext in the local (git-ignored) DB.
 - **Output quality** ≈ free-model ceiling × context surviving anonymization. Coding and agent work fit best, since logic and structure survive masking.
+- **Free-tier rate limits are per-account.** OpenRouter caps `:free` models at ~20 req/min and 50 req/day — 1000/day once you've purchased ≥10 credits — shared across *all* free models, and a failed request still counts against the daily budget. PrivacyProxy therefore does **not** fail over on a `429` (it can't help, and each attempt burns quota); it returns the `429` with any upstream `Retry-After` so your client can back off. A negative balance returns `402`.
 
 ## Project layout
 

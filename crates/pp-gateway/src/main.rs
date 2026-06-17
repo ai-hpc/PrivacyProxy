@@ -334,6 +334,37 @@ fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
 }
 
 fn provider_error_response(err: ProviderError) -> Response {
+    // Rate limiting gets a real 429 (not a generic 5xx) plus any upstream
+    // Retry-After, so clients/agents can back off instead of hammering the
+    // shared per-account free-tier budget.
+    if let ProviderError::RateLimited {
+        retry_after,
+        detail,
+    } = &err
+    {
+        tracing::warn!(retry_after = ?retry_after, "upstream rate limited (429)");
+        let mut headers = HeaderMap::new();
+        if let Some(v) = retry_after
+            .as_ref()
+            .and_then(|r| r.parse::<axum::http::HeaderValue>().ok())
+        {
+            headers.insert(axum::http::header::RETRY_AFTER, v);
+        }
+        let message = if detail.is_empty() {
+            "upstream rate limited — OpenRouter free tier allows ~20 req/min and \
+             50–1000 req/day per account, shared across all free models"
+                .to_string()
+        } else {
+            format!("upstream rate limited: {detail}")
+        };
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            headers,
+            Json(json!({ "error": { "message": message, "type": "rate_limited" } })),
+        )
+            .into_response();
+    }
+
     let code = match &err {
         ProviderError::NoCandidates => StatusCode::INTERNAL_SERVER_ERROR,
         ProviderError::Upstream(status, _) => {
@@ -596,5 +627,18 @@ mod tests {
     fn vocab_empty_inputs() {
         assert!(vocab_terms("", None).is_empty());
         assert!(vocab_terms("  ,  ", None).is_empty());
+    }
+
+    #[test]
+    fn rate_limited_maps_to_429_with_retry_after() {
+        let resp = provider_error_response(ProviderError::RateLimited {
+            retry_after: Some("12".to_string()),
+            detail: String::new(),
+        });
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get(axum::http::header::RETRY_AFTER).unwrap(),
+            "12"
+        );
     }
 }
