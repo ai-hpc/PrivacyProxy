@@ -2,10 +2,16 @@
 //! router over OpenRouter's free models (`ARCHITECTURE.md` §12).
 //!
 //! `RouterConfig`/`candidates` are pure and unit-testable. `OpenRouterProvider`
-//! performs the real async HTTP with failover across the configured models.
+//! performs the real async HTTP with failover across the configured models,
+//! for both buffered (`chat`) and streaming (`chat_stream`) responses.
 #![forbid(unsafe_code)]
 
+use std::pin::Pin;
+use std::time::Duration;
+
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::{Stream, TryStreamExt};
 use serde_json::Value;
 
 /// One configured upstream model.
@@ -56,16 +62,29 @@ pub enum ProviderError {
     Decode(String),
 }
 
+/// A boxed stream of upstream response bytes (SSE frames, for streaming).
+pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, ProviderError>> + Send>>;
+
 /// An upstream LLM provider. Receives an already-sanitized request body.
 #[async_trait]
 pub trait Provider: Send + Sync {
-    /// `needs_tools` lets the router restrict candidates to tool-capable models.
+    /// Buffered (non-streaming) completion.
     async fn chat(&self, body: &Value, needs_tools: bool) -> Result<Value, ProviderError>;
+
+    /// Streaming completion: returns the upstream's raw SSE byte stream. The
+    /// caller is responsible for rehydrating placeholders within the frames.
+    async fn chat_stream(
+        &self,
+        body: &Value,
+        needs_tools: bool,
+    ) -> Result<ByteStream, ProviderError>;
 }
 
 /// Talks to OpenRouter's OpenAI-compatible endpoint, with capability-aware
-/// failover across the configured free models (retries the next model on
-/// 429 / 5xx / transport errors; returns 4xx bodies straight through).
+/// failover across the configured free models. Failover triggers on
+/// 429 / 5xx / transport errors; 4xx bodies are returned straight through.
+/// For streaming, failover applies to the initial response status only — once
+/// a model starts streaming, we commit to it.
 pub struct OpenRouterProvider {
     http: reqwest::Client,
     api_key: String,
@@ -75,10 +94,11 @@ pub struct OpenRouterProvider {
 
 impl OpenRouterProvider {
     pub fn new(api_key: String, config: RouterConfig) -> Self {
-        // A per-request timeout is essential: without it a hung/slow free
-        // model would stall the whole request instead of failing over.
+        // Connect-timeout only on the client: a per-request timeout is applied
+        // below (short for buffered calls, long for streams) so a slow model
+        // fails over instead of hanging — without capping long generations.
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(45))
+            .connect_timeout(Duration::from_secs(20))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
@@ -87,6 +107,15 @@ impl OpenRouterProvider {
             config,
             endpoint: "https://openrouter.ai/api/v1/chat/completions".to_string(),
         }
+    }
+
+    fn route(&self, body: &Value, model: &str, stream: bool) -> Value {
+        let mut payload = body.clone();
+        if let Value::Object(map) = &mut payload {
+            map.insert("model".into(), Value::String(model.to_string()));
+            map.insert("stream".into(), Value::Bool(stream));
+        }
+        payload
     }
 }
 
@@ -100,16 +129,12 @@ impl Provider for OpenRouterProvider {
 
         let mut last: Option<ProviderError> = None;
         for model in candidates {
-            // Route to this candidate by overriding the (advisory) model field.
-            let mut payload = body.clone();
-            if let Value::Object(map) = &mut payload {
-                map.insert("model".into(), Value::String(model.id.clone()));
-            }
-
+            let payload = self.route(body, &model.id, false);
             let sent = self
                 .http
                 .post(&self.endpoint)
                 .bearer_auth(&self.api_key)
+                .timeout(Duration::from_secs(45))
                 .json(&payload)
                 .send()
                 .await;
@@ -125,10 +150,58 @@ impl Provider for OpenRouterProvider {
                     }
                     let code = status.as_u16();
                     if code == 429 || status.is_server_error() {
-                        last = Some(ProviderError::AllFailed(Some(code))); // retryable
+                        last = Some(ProviderError::AllFailed(Some(code)));
                         continue;
                     }
-                    // Non-retryable client error — surface it directly.
+                    let detail = resp.text().await.unwrap_or_default();
+                    return Err(ProviderError::Upstream(code, detail));
+                }
+                Err(e) => {
+                    last = Some(ProviderError::Transport(e.to_string()));
+                    continue;
+                }
+            }
+        }
+        Err(last.unwrap_or(ProviderError::AllFailed(None)))
+    }
+
+    async fn chat_stream(
+        &self,
+        body: &Value,
+        needs_tools: bool,
+    ) -> Result<ByteStream, ProviderError> {
+        let candidates = self.config.candidates(needs_tools);
+        if candidates.is_empty() {
+            return Err(ProviderError::NoCandidates);
+        }
+
+        let mut last: Option<ProviderError> = None;
+        for model in candidates {
+            let payload = self.route(body, &model.id, true);
+            let sent = self
+                .http
+                .post(&self.endpoint)
+                .bearer_auth(&self.api_key)
+                .timeout(Duration::from_secs(300))
+                .json(&payload)
+                .send()
+                .await;
+
+            match sent {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        let stream = resp
+                            .bytes_stream()
+                            .map_err(|e| ProviderError::Transport(e.to_string()));
+                        let boxed: ByteStream = Box::pin(stream);
+                        return Ok(boxed);
+                    }
+                    let code = status.as_u16();
+                    if code == 429 || status.is_server_error() {
+                        last = Some(ProviderError::AllFailed(Some(code)));
+                        continue;
+                    }
                     let detail = resp.text().await.unwrap_or_default();
                     return Err(ProviderError::Upstream(code, detail));
                 }

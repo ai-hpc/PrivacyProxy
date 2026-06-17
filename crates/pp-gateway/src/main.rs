@@ -1,27 +1,36 @@
 //! `pp-gateway` — the `privacyproxy` binary: an OpenAI-compatible HTTP gateway
 //! that anonymises requests, routes to OpenRouter's free models with failover,
-//! and rehydrates responses (`ARCHITECTURE.md` §5, §12).
+//! and rehydrates responses — buffered and streaming (`ARCHITECTURE.md` §5,
+//! §10, §12).
 #![forbid(unsafe_code)]
 
 mod pipeline;
 
+use std::convert::Infallible;
 use std::env;
 use std::sync::Arc;
 
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, post},
     Json, Router,
 };
-use pp_anonymize::egress_guard;
-use pp_core::{Detector, EntityKind};
+use eventsource_stream::Eventsource;
+use futures::{Stream, StreamExt};
+use pp_anonymize::{egress_guard, StreamRehydrator};
+use pp_core::{Detector, EntityKind, Vault};
 use pp_detect::{EmailRecognizer, Ensemble, EntropyRecognizer, GazetteerRecognizer};
 use pp_protocol::ChatRequest;
 use pp_store::MemVault;
-use pp_upstream::{ModelEntry, OpenRouterProvider, Provider, ProviderError, RouterConfig};
-use serde_json::json;
+use pp_upstream::{
+    ByteStream, ModelEntry, OpenRouterProvider, Provider, ProviderError, RouterConfig,
+};
+use serde_json::{json, Value};
 
 /// Shared, immutable application state.
 struct AppState {
@@ -92,11 +101,12 @@ async fn chat_completions(
         return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
     }
 
-    // Per-request vault: placeholders are consistent within the request and
-    // never leak to the client (always rehydrated before returning).
-    let vault = MemVault::new();
-    let audit = pipeline::anonymize_request(&mut req, &state.anonymizer, &vault);
+    // Per-request vault (Arc so it can move into the streaming task). Placeholders
+    // are consistent within the request and never leak to the client.
+    let vault: Arc<dyn Vault> = Arc::new(MemVault::new());
+    let audit = pipeline::anonymize_request(&mut req, &state.anonymizer, &*vault);
     let needs_tools = req.has_tools();
+    let streaming = req.stream == Some(true);
 
     let sanitized = match serde_json::to_value(&req) {
         Ok(v) => v,
@@ -129,16 +139,76 @@ async fn chat_completions(
     tracing::info!(
         redactions = audit.len(),
         needs_tools,
+        streaming,
         "forwarding sanitised request"
     );
 
-    match state.provider.chat(&sanitized, needs_tools).await {
-        Ok(mut resp) => {
-            pipeline::rehydrate_response(&mut resp, &vault);
-            Json(resp).into_response()
+    if streaming {
+        match state.provider.chat_stream(&sanitized, needs_tools).await {
+            Ok(upstream) => sse_rehydrated(upstream, vault).into_response(),
+            Err(err) => provider_error_response(err),
         }
-        Err(err) => provider_error_response(err),
+    } else {
+        match state.provider.chat(&sanitized, needs_tools).await {
+            Ok(mut resp) => {
+                pipeline::rehydrate_response(&mut resp, &*vault);
+                Json(resp).into_response()
+            }
+            Err(err) => provider_error_response(err),
+        }
     }
+}
+
+/// Transform the upstream SSE byte stream into a rehydrated SSE response: parse
+/// each `data:` frame, restore placeholders in `delta.content` (reassembling
+/// any split across frames via [`StreamRehydrator`]), and re-emit.
+fn sse_rehydrated(
+    upstream: ByteStream,
+    vault: Arc<dyn Vault>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = async_stream::stream! {
+        let mut rehydrators: Vec<StreamRehydrator> = Vec::new();
+        let mut events = upstream.eventsource();
+        while let Some(item) = events.next().await {
+            let event = match item {
+                Ok(event) => event,
+                Err(_) => break, // upstream stream error → end the response
+            };
+            if event.data == "[DONE]" {
+                for r in rehydrators.iter_mut() {
+                    let tail = r.flush(&*vault);
+                    if !tail.is_empty() {
+                        yield ev(tail_chunk(&tail));
+                    }
+                }
+                yield ev("[DONE]".to_string());
+                return;
+            }
+            match serde_json::from_str::<Value>(&event.data) {
+                Ok(mut chunk) => {
+                    pipeline::rehydrate_deltas(&mut chunk, &mut rehydrators, &*vault);
+                    yield ev(chunk.to_string());
+                }
+                Err(_) => yield ev(event.data),
+            }
+        }
+        // Upstream ended without an explicit [DONE]: flush any held tails.
+        for r in rehydrators.iter_mut() {
+            let tail = r.flush(&*vault);
+            if !tail.is_empty() {
+                yield ev(tail_chunk(&tail));
+            }
+        }
+    };
+    Sse::new(stream)
+}
+
+fn ev(data: String) -> Result<Event, Infallible> {
+    Ok(Event::default().data(data))
+}
+
+fn tail_chunk(content: &str) -> String {
+    json!({ "choices": [{ "index": 0, "delta": { "content": content } }] }).to_string()
 }
 
 fn authorized(state: &AppState, headers: &HeaderMap) -> bool {

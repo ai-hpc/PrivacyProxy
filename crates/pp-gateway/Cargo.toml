@@ -22,3 +22,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Streaming (SSE)
+futures = "0.3"
+async-stream = "0.3"
+eventsource-stream = "0.2"

@@ -1,7 +1,7 @@
 //! Request/response transforms for the gateway: anonymise outbound message
-//! content, rehydrate inbound response strings.
+//! content, rehydrate inbound responses (batch and streaming).
 
-use pp_anonymize::{anonymize, rehydrate};
+use pp_anonymize::{anonymize, rehydrate, StreamRehydrator};
 use pp_core::{Redaction, Vault};
 use pp_detect::Ensemble;
 use pp_protocol::ChatRequest;
@@ -26,9 +26,9 @@ pub fn anonymize_request(
     audit
 }
 
-/// Rehydrate every string in the response value tree. Placeholders only occur
-/// where the gateway put them, so a blanket walk is safe and also covers
-/// tool-call argument strings.
+/// Rehydrate every string in a buffered (non-streaming) response value tree.
+/// Placeholders only occur where the gateway put them, so a blanket walk is
+/// safe and also covers tool-call argument strings.
 pub fn rehydrate_response(value: &mut Value, vault: &dyn Vault) {
     match value {
         Value::String(s) => {
@@ -46,10 +46,35 @@ pub fn rehydrate_response(value: &mut Value, vault: &dyn Vault) {
     }
 }
 
+/// Rehydrate the `choices[].delta.content` of a single streaming SSE chunk,
+/// using a per-choice-index [`StreamRehydrator`] so a placeholder split across
+/// chunks is reassembled. `rehydrators` persists for the whole stream; a chunk
+/// may emit empty content while the tail of a placeholder is withheld.
+pub fn rehydrate_deltas(
+    chunk: &mut Value,
+    rehydrators: &mut Vec<StreamRehydrator>,
+    vault: &dyn Vault,
+) {
+    let Some(choices) = chunk.get_mut("choices").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for choice in choices {
+        let idx = choice.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+        while rehydrators.len() <= idx {
+            rehydrators.push(StreamRehydrator::new());
+        }
+        if let Some(Value::String(content)) =
+            choice.get_mut("delta").and_then(|d| d.get_mut("content"))
+        {
+            *content = rehydrators[idx].push(content.as_str(), vault);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pp_core::EntityKind;
+    use pp_core::{EntityKind, Vault};
     use pp_detect::GazetteerRecognizer;
     use pp_store::MemVault;
     use serde_json::json;
@@ -72,17 +97,31 @@ mod tests {
     #[test]
     fn round_trip_through_a_simulated_upstream() {
         let vault = MemVault::new();
-
-        // Outbound: "Alex" never leaves the box.
         let mut req = req_with("Hello Alex");
         anonymize_request(&mut req, &floor(), &vault);
         assert_eq!(req.messages[0].content.as_deref(), Some("Hello ⟦PERSON_1⟧"));
 
-        // Inbound: the model echoes the placeholder; we restore it.
         let mut resp = json!({
             "choices": [{ "message": { "role": "assistant", "content": "Hi ⟦PERSON_1⟧!" } }]
         });
         rehydrate_response(&mut resp, &vault);
         assert_eq!(resp["choices"][0]["message"]["content"], json!("Hi Alex!"));
+    }
+
+    #[test]
+    fn streaming_deltas_rehydrate_across_chunks() {
+        let vault = MemVault::new();
+        let ph = vault.intern("Alex", &EntityKind::Person);
+        assert_eq!(ph.as_str(), "⟦PERSON_1⟧");
+
+        let mut rehydrators = Vec::new();
+
+        let mut chunk1 = json!({"choices":[{"index":0,"delta":{"content":"Hi ⟦PER"}}]});
+        rehydrate_deltas(&mut chunk1, &mut rehydrators, &vault);
+        assert_eq!(chunk1["choices"][0]["delta"]["content"], json!("Hi "));
+
+        let mut chunk2 = json!({"choices":[{"index":0,"delta":{"content":"SON_1⟧!"}}]});
+        rehydrate_deltas(&mut chunk2, &mut rehydrators, &vault);
+        assert_eq!(chunk2["choices"][0]["delta"]["content"], json!("Alex!"));
     }
 }
